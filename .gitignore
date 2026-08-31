@@ -1,11 +1,26 @@
 .DS_Store
+Thumbs.db
 
+# Local runtime / generated artefacts
 /.venv
+/venv
 /analysing
 /pdf-craft-output
 /models-cache
 /format.json
+/*.pdf
+/*.epub
+
+# Secrets and machine-local editor config
+.env
+.env.*
 /.env
+.vscode/sftp.json
+.idea/
+.cursor/
+
+# Tool caches not covered below
+.ruff_cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
