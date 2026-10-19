@@ -6,8 +6,8 @@ Grounding-markdown on a thin strip also hallucinates (math / HTML tables).
 Strategy per page:
   1. Detect where the dual-column body starts (center gutter + ink on both sides)
   2. Slice each column into short overlapping bands plus a last-line tail crop
-  3. Suppress verso bleed, pad the band onto a white page
-  4. Transcribe with Free OCR (plain lines, keep ※ / ▼)
+  3. Extract each band through the configured page extractor
+  4. Preserve vocabulary lines and table cells, including ※ / ▼
   5. Merge layouts with coordinate offsets
 """
 
@@ -19,12 +19,14 @@ import numpy as np
 from PIL.Image import Image
 
 from ..common import AssetHub, XMLReader, save_xml
+from ..error import OCRError
+from ..ocr_config import DeepSeekOCRLocalConfig, DeepSeekOCR2LocalConfig
 from ..pdf.handler import DefaultPDFHandler
 from ..pdf.ocr import OCREvent, OCREventKind
 from ..pdf.page_extractor import PageExtractorNode
 from ..pdf.types import DeepSeekOCRSize, Page, PageLayout, decode, encode
 from ..types import DeepSeekOCRModelId, TextLayout
-from .vocab_cleanup import cleanup_vocab_lines, lines_from_ocr_response
+from .vocab_cleanup import clean_pseudo_tags, cleanup_vocab_lines, lines_from_ocr_response
 from .vocab_image import is_weak_print
 
 # Overlap into the gutter so edge glyphs are not clipped
@@ -34,9 +36,6 @@ _GUTTER_RATIO = 0.03
 _BAND_OVERLAP_RATIO = 0.18
 _MIN_BAND_PX = 220
 _TAIL_LINES = 5
-_VOCAB_OCR_PROMPT = (
-    "<image>\n<|grounding|>Convert the document to markdown."
-)
 
 # DeepSeek-OCR-2 SAM+Qwen encoder only has query tables for 768 (144) and
 # 1024 (256). Native 512/640/1280 (tiny/small/large) crash in the vision tower.
@@ -86,6 +85,13 @@ def load_ocr_pages(ocr_path: Path) -> dict[int, Page]:
     return pages
 
 
+def _local_ocr_config(
+    model: DeepSeekOCRModelId, models_cache_path: Path, local_only: bool,
+) -> DeepSeekOCRLocalConfig | DeepSeekOCR2LocalConfig:
+    config_type = DeepSeekOCR2LocalConfig if model == "deepseek-ocr-2" else DeepSeekOCRLocalConfig
+    return config_type(models_cache_path=models_cache_path, local_only=local_only)
+
+
 def run_deepseek_ocr(
     pdf_path: Path,
     ocr_path: Path,
@@ -127,10 +133,8 @@ def run_deepseek_ocr(
     asset_path.mkdir(parents=True, exist_ok=True)
 
     engine = OCR(
-        model_path=models_cache_path,
+        ocr=_local_ocr_config(ocr_model, models_cache_path, local_only),
         pdf_handler=None,
-        local_only=local_only,
-        ocr_model=ocr_model,
     )
     for event in engine.recognize(
         pdf_path=pdf_path,
@@ -139,7 +143,7 @@ def run_deepseek_ocr(
         ocr_size=ocr_size,
         dpi=dpi,
         includes_footnotes=False,
-        text_layout=text_layout,
+        page_indexes=page_indexes if page_indexes is not None else range(1, 2**31),
     ):
         if on_event is not None:
             on_event(event)
@@ -168,9 +172,7 @@ def run_deepseek_column_ocr(
     asset_path.mkdir(parents=True, exist_ok=True)
 
     extractor = PageExtractorNode(
-        model_path=models_cache_path,
-        local_only=local_only,
-        ocr_model=ocr_model,
+        ocr=_local_ocr_config(ocr_model, models_cache_path, local_only),
     )
     asset_hub = AssetHub(asset_path)
     document = DefaultPDFHandler().open(pdf_path)
@@ -232,7 +234,7 @@ def run_deepseek_column_ocr(
                 slice_bands=slice_bands,
                 band_lines=band_lines,
                 dpi=dpi,
-                on_region=lambda name: print(
+                on_region=lambda name, page_index=page_index: print(
                     f"  region={name} page={page_index}/{total}",
                     flush=True,
                 ),
@@ -355,23 +357,13 @@ def _column_ink_range(
     win = max(3, gray.shape[0] // 400)
     dark = np.convolve(dark, np.ones(win, dtype=np.float32) / win, mode="same")
     thr = max(0.0035, float(np.percentile(dark, 70)) * 0.35)
-    footer = max(8, int(gray.shape[0] * 0.08))
-    limit = gray.shape[0] - footer
-    hits = np.flatnonzero(dark[:limit] >= thr)
+    # A fixed footer or a long blank gap is not evidence that the column ended.
+    # Section breaks and short final rows must remain eligible for OCR.
+    hits = np.flatnonzero(dark >= thr)
     if hits.size == 0:
         return y1, y1
     start = int(hits[0])
-    end = start
-    empty_run = 0
-    max_empty = max(48, int(_typical_line_from_ink((255.0 - gray).mean(axis=1)) * 2.5))
-    for y in range(start, limit):
-        if dark[y] >= thr:
-            end = y
-            empty_run = 0
-        else:
-            empty_run += 1
-            if empty_run > max_empty and (y - start) > max_empty * 3:
-                break
+    end = int(hits[-1]) + 1
     pad = max(8, int(_typical_line_from_ink((255.0 - gray).mean(axis=1))))
     return y1 + max(0, start - pad), y1 + min(gray.shape[0], end + pad)
 
@@ -423,7 +415,7 @@ def _ocr_page_by_columns(
     dpi: int = 400,
     on_region=None,
 ) -> Page:
-    del asset_hub, text_layout  # Free-OCR path does not use layout extraction
+    del text_layout  # Column ordering is handled when the page is normalized.
     width, height = image.size
     mid = width // 2
     pad = max(8, int(width * _GUTTER_RATIO))
@@ -485,23 +477,48 @@ def _ocr_page_by_columns(
             continue
 
         try:
-            raw_text, in_tok, out_tok = extractor.transcribe_image(
-                crop,
-                prompt=_VOCAB_OCR_PROMPT,
+            raw_text, in_tok, out_tok = _extract_region_text(
+                extractor=extractor,
+                crop=crop,
+                page_index=page_index,
+                asset_hub=asset_hub,
                 ocr_size=transcribe_size,
             )
+            input_tokens += in_tok
+            output_tokens += out_tok
+            if not clean_pseudo_tags(raw_text) and crop.height >= 32:
+                # Dense bands can produce empty table markup. Retry two smaller,
+                # overlapping crops so a line at the split remains fully visible.
+                retry_texts: list[str] = []
+                for top, bottom in ((0, crop.height * 3 // 5), (crop.height * 2 // 5, crop.height)):
+                    retry_text, in_tok, out_tok = _extract_region_text(
+                        extractor=extractor,
+                        crop=crop.crop((0, top, crop.width, bottom)),
+                        page_index=page_index,
+                        asset_hub=asset_hub,
+                        ocr_size=transcribe_size,
+                    )
+                    retry_texts.append(retry_text)
+                    input_tokens += in_tok
+                    output_tokens += out_tok
+                raw_text = "\n".join(retry_texts)
         except Exception as error:
-            print(
-                f"  OCR failed region={region_name} page={page_index}: {error}",
-                flush=True,
-            )
-            continue
-        input_tokens += in_tok
-        output_tokens += out_tok
-
+            # Do not cache an incomplete page as successfully recognized.
+            raise OCRError(
+                f"OCR failed region={region_name} page={page_index}: {error}",
+                page_index=page_index,
+                step_index=1,
+            ) from error
         lines = cleanup_vocab_lines(lines_from_ocr_response(raw_text))
         if not lines:
-            continue
+            if clean_pseudo_tags(raw_text):
+                # A recognized page number or ornament is not a missing OCR result.
+                continue
+            raise OCRError(
+                f"OCR returned no usable text for region={region_name} page={page_index}",
+                page_index=page_index,
+                step_index=1,
+            )
 
         side = "header"
         if region_name.startswith("left"):
@@ -551,11 +568,36 @@ def _ocr_page_by_columns(
     )
 
 
+def _extract_region_text(
+    *,
+    extractor: PageExtractorNode,
+    crop: Image,
+    page_index: int,
+    asset_hub: AssetHub,
+    ocr_size: DeepSeekOCRSize,
+) -> tuple[str, int, int]:
+    page = extractor.image2page(
+        image=crop,
+        page_index=page_index,
+        asset_hub=asset_hub,
+        ocr_size=ocr_size,
+        includes_footnotes=False,
+        includes_raw_image=False,
+        plot_path=None,
+        max_tokens=None,
+        max_output_tokens=None,
+        device_number=None,
+        aborted=lambda: False,
+    )
+    text = "\n".join(layout.text for layout in page.body_layouts if layout.ref != "image")
+    return text, page.input_tokens, page.output_tokens
+
+
 def _band_ocr_size(
     ocr_model: DeepSeekOCRModelId,
     ocr_size: DeepSeekOCRSize,
 ) -> DeepSeekOCRSize:
-    """Padded bands should not use gundam's dynamic crop tiles."""
+    """Use a supported fixed resolution for short OCR2 bands."""
     if ocr_model == "deepseek-ocr-2":
         return "base"
     return coerce_ocr_size(ocr_model, ocr_size)

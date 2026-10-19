@@ -78,8 +78,6 @@ def is_usable_vocab_text(text: str) -> bool:
         return False
     if len(_NUMBERED_KNOWN.findall(value)) >= 2:
         return False
-    if len(value) > 800:
-        return False
     if _HAS_CJK.search(value) or re.search(r"[ァ-ヶーぁ-ん]", value):
         return True
     if _ALNUM_HEAD.search(value) and re.search(r"\d", value):
@@ -146,12 +144,13 @@ def cut_repeating_entries(
     ``了承, 涼風, 料理人, 緑化, 利率, 料理人, 緑化, 利率, …``
     → ``了承, 涼風, 料理人, 緑化, 利率``.
 
-    Headwords may differ by one character (``緑化`` vs ``緗化``).
+    Only identical complete entries count as repeats. Similar headwords and
+    different lesson references can be legitimate vocabulary entries.
     """
     if len(entries) < min_cycles * 2:
         return entries
 
-    keys = [headword_key(item) or item.strip() for item in entries]
+    keys = [re.sub(r"\s+", "", clean_vocab_line(item)) for item in entries]
     n = len(keys)
     i = 0
     kept: list[str] = []
@@ -166,7 +165,7 @@ def cut_repeating_entries(
                 continue
             repeats = 1
             pos = i + period
-            while pos + period <= n and _blocks_match(keys[pos : pos + period], block):
+            while pos + period <= n and keys[pos : pos + period] == block:
                 repeats += 1
                 pos += period
             if repeats >= min_cycles:
@@ -180,34 +179,6 @@ def cut_repeating_entries(
         kept.append(entries[i])
         i += 1
     return kept
-
-
-def _blocks_match(left: list[str], right: list[str]) -> bool:
-    return len(left) == len(right) and all(
-        _keys_match(a, b) for a, b in zip(left, right)
-    )
-
-
-def _keys_match(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    if not left or not right:
-        return False
-    if abs(len(left) - len(right)) > 1:
-        return False
-    if len(left) == len(right):
-        return sum(a != b for a, b in zip(left, right)) <= 1
-    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
-    i = 0
-    skipped = False
-    for ch in longer:
-        if i < len(shorter) and ch == shorter[i]:
-            i += 1
-        elif skipped:
-            return False
-        else:
-            skipped = True
-    return i == len(shorter)
 
 
 def dedupe_adjacent(entries: list[str], *, window: int = 16) -> list[str]:
@@ -270,65 +241,52 @@ def trim_repeating_table_html(text: str, *, min_cycles: int = 3) -> str:
     if len(rows) < min_cycles * 2:
         return value
 
-    keys: list[str] = []
-    row_html: list[str] = []
-    for match in rows:
-        row_html.append(match.group(0))
-        cells = [_cell_key(cell) for cell in _TD_INNER.findall(match.group(0))]
-        keys.append("|".join(cell for cell in cells if cell))
+    row_html = [match.group(0) for match in rows]
 
     kept_html = cut_repeating_entries(row_html, min_cycles=min_cycles)
     if len(kept_html) >= len(row_html):
         return value
-    start = rows[0].start()
-    end = rows[-1].end()
-    return value[:start] + "".join(kept_html) + value[end:]
+    # Keep all material between rows, including text between separate tables.
+    kept = iter(kept_html)
+    next_row = next(kept, None)
+    chunks: list[str] = []
+    offset = 0
+    for row in rows:
+        chunks.append(value[offset:row.start()])
+        if row.group(0) == next_row:
+            chunks.append(row.group(0))
+            next_row = next(kept, None)
+        offset = row.end()
+    chunks.append(value[offset:])
+    return "".join(chunks)
 
 
 def lines_from_ocr_response(text: str) -> list[str]:
     """Turn a Free-OCR / grounding dump into candidate vocab lines."""
     value = _GROUNDING_BLOCK.sub("\n", text or "")
     value = trim_repetitive_tail(value)
-    if "<table" in value.lower() or "<tr" in value.lower():
-        table_lines = _table_html_to_lines(value)
-        if table_lines:
-            return table_lines
     lines: list[str] = []
-    for raw in value.splitlines():
-        line = clean_vocab_line(raw)
-        if not line:
-            continue
-        parts = split_fused_vocab_line(line)
-        lines.extend(parts or [line])
+    # Parse table rows in place: an OCR response may mix prose and several tables.
+    offset = 0
+    for row in _TR_BLOCK.finditer(value):
+        lines.extend(_plain_vocab_lines(value[offset:row.start()]))
+        cells = [clean_pseudo_tags(cell) for cell in _TD_INNER.findall(row.group(0))]
+        cells = [cell for cell in cells if cell]
+        # A crop can start with the previous row's trailing lesson number.
+        while cells and _looks_like_page_ref(cells[0]):
+            cells.pop(0)
+        lines.extend(_plain_vocab_lines(" ".join(cells)))
+        offset = row.end()
+    lines.extend(_plain_vocab_lines(value[offset:]))
     return lines
 
 
-def _table_html_to_lines(html_text: str) -> list[str]:
+def _plain_vocab_lines(text: str) -> list[str]:
     lines: list[str] = []
-    for match in _TR_BLOCK.finditer(html_text):
-        cells = [clean_pseudo_tags(cell) for cell in _TD_INNER.findall(match.group(0))]
-        cells = [cell for cell in cells if cell]
-        if not cells:
-            continue
-        if len(cells) >= 4:
-            lines.append(f"{cells[0]} {cells[1]}".strip())
-            lines.append(f"{cells[2]} {cells[3]}".strip())
-            continue
-        if len(cells) == 3:
-            # leftover glyph + headword + lesson, e.g. 2※ / 悪口 / 26※
-            if _looks_like_page_ref(cells[0]) and not _HAS_CJK.search(cells[0]):
-                lines.append(f"{cells[1]} {cells[2]}".strip())
-            elif _looks_like_page_ref(cells[2]):
-                lines.append(f"{cells[0]} {cells[1]}".strip())
-                if not _looks_like_page_ref(cells[1]):
-                    lines[-1] = f"{cells[0]} {cells[1]} {cells[2]}".strip()
-            else:
-                lines.append(" ".join(cells))
-            continue
-        if len(cells) == 2:
-            lines.append(f"{cells[0]} {cells[1]}".strip())
-            continue
-        lines.append(cells[0])
+    for raw in text.splitlines():
+        line = clean_vocab_line(raw)
+        if line:
+            lines.extend(split_fused_vocab_line(line) or [line])
     return lines
 
 
@@ -348,10 +306,6 @@ def cleanup_vocab_lines(lines: list[str]) -> list[str]:
     cleaned = cut_repeating_entries(cleaned)
     cleaned = dedupe_adjacent(cleaned)
     return [line for line in cleaned if line]
-
-
-def _cell_key(cell_html: str) -> str:
-    return headword_key(cell_html)
 
 
 def _richer_page_refs(candidate: str, current: str) -> bool:

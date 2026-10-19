@@ -6,6 +6,7 @@ from pdf_craft.ocr_pdf.vocab_cleanup import (
     cleanup_vocab_lines,
     cut_repeating_entries,
     headword_key,
+    lines_from_ocr_response,
     trim_repeating_table_html,
 )
 from pdf_craft.pdf.ngrams import trim_repetitive_tail
@@ -17,26 +18,67 @@ class TestVocabCleanup(unittest.TestCase):
         self.assertEqual(clean_pseudo_tags("利率 （td）"), "利率")
         self.assertIn("おなかが", clean_pseudo_tags("いっぱい <おなかが>"))
 
-    def test_cut_repeating_with_ocr_typo(self):
-        kept = cut_repeating_entries(
-            [
-                "了承 18※",
-                "涼風 18※",
-                "料理人 21※",
-                "緑化 19※",
-                "利率 19▼",
-                "料理人 21※",
-                "緗化 19※",
-                "利率 （td）",
-                "料理人 21※",
-                "緗化 19※",
-                "利率 1",
-            ]
+    def test_preserves_differing_entries_in_apparent_loop(self):
+        entries = [
+            "了承 18※",
+            "涼風 18※",
+            "料理人 21※",
+            "緑化 19※",
+            "利率 19▼",
+            "料理人 21※",
+            "緗化 19※",
+            "利率 （td）",
+            "料理人 21※",
+            "緗化 19※",
+            "利率 1",
+        ]
+        self.assertEqual(cut_repeating_entries(entries), entries)
+
+    def test_similar_short_words_are_not_repetition(self):
+        entries = ["会う 1", "合う 2", "遭う 3", "買う 4", "飼う 5", "言う 6"]
+        self.assertEqual(cleanup_vocab_lines(entries), entries)
+
+    def test_overlap_does_not_delete_next_distinct_word(self):
+        entries = [
+            "例 25※", "冷害 30▼", "冷害 30", "冷戦 19※", "冷凍する 29", "レート 19",
+        ]
+        self.assertEqual(cleanup_vocab_lines(entries), [
+            "例 25※", "冷害 30▼", "冷戦 19※", "冷凍する 29", "レート 19",
+        ])
+
+    def test_repeated_headword_with_different_lessons_is_kept(self):
+        entries = [f"腰痛 {number}" for number in range(1, 7)]
+        self.assertEqual(cleanup_vocab_lines(entries), entries)
+
+    def test_text_around_tables_is_preserved(self):
+        raw = (
+            "隣国 23※\n<table><tr><td>リンス</td><td>21▼</td></tr></table>\n"
+            "ルーツ 21\n<table><tr><td>例</td><td>25※</td></tr></table>\n冷害 30▼"
         )
-        self.assertEqual(
-            kept,
-            ["了承 18※", "涼風 18※", "料理人 21※", "緑化 19※", "利率 19▼"],
+        self.assertEqual(cleanup_vocab_lines(lines_from_ocr_response(raw)), [
+            "隣国 23※", "リンス 21▼", "ルーツ 21", "例 25※", "冷害 30▼",
+        ])
+
+    def test_all_table_cells_are_preserved(self):
+        raw = (
+            "<table><tr><td>隣国</td><td>23※</td><td>リンス</td><td>21▼</td>"
+            "<td>ルーツ</td><td>21</td></tr></table>"
         )
+        self.assertEqual(cleanup_vocab_lines(lines_from_ocr_response(raw)), [
+            "隣国 23※", "リンス 21▼", "ルーツ 21",
+        ])
+
+    def test_long_valid_entry_is_preserved(self):
+        entry = "日本語" * 270 + " 21"
+        self.assertEqual(cleanup_vocab_lines([entry]), [entry])
+
+    def test_table_loop_cleanup_keeps_text_between_tables(self):
+        rows = "<tr><td>料理人</td><td>21※</td></tr><tr><td>利率</td><td>19▼</td></tr>"
+        raw = f"<table>{rows}</table>\n隣国 23※\n<table>{rows * 3}</table>\nリンス 21▼"
+        trimmed = trim_repeating_table_html(raw)
+        self.assertIn("隣国 23※", trimmed)
+        self.assertIn("リンス 21▼", trimmed)
+        self.assertEqual(trimmed.count("料理人"), 1)
 
     def test_cut_repeating_interest_cook_cycle(self):
         kept = cut_repeating_entries(
@@ -95,8 +137,6 @@ class TestVocabCleanup(unittest.TestCase):
         self.assertEqual(lines, ["悪口 26※", "ワンワン 23▼"])
 
     def test_lines_from_ocr_response_splits_fused(self):
-        from pdf_craft.ocr_pdf.vocab_cleanup import lines_from_ocr_response
-
         lines = lines_from_ocr_response(
             "悪口 26※ ワンワン 23▼\n"
             "<|ref|>text<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\n"
@@ -107,8 +147,6 @@ class TestVocabCleanup(unittest.TestCase):
         self.assertIn("若い 31▼", lines)
 
     def test_table_html_keeps_last_entries(self):
-        from pdf_craft.ocr_pdf.vocab_cleanup import lines_from_ocr_response
-
         html = (
             "<table><tr><td></td><td>ロジオ</td><td>ロジオ</td></tr>"
             "<tr><td>2※</td><td>悪口</td><td>26※</td></tr>"
@@ -158,6 +196,16 @@ class TestVocabCleanup(unittest.TestCase):
 
 
 class TestVocabImage(unittest.TestCase):
+    def test_sparse_dark_print_is_not_blank(self):
+        from PIL import Image, ImageDraw
+
+        from pdf_craft.ocr_pdf.vocab_image import is_weak_print
+
+        image = Image.new("RGB", (1000, 400), "white")
+        ImageDraw.Draw(image).rectangle((100, 50, 119, 59), fill="black")
+        self.assertFalse(is_weak_print(image, (0, 0, 1000, 400)))
+        self.assertTrue(is_weak_print(Image.new("RGB", (1000, 400), (200, 200, 200)), (0, 0, 1000, 400)))
+
     def test_suppress_bleed_keeps_dark_ink(self):
         from PIL import Image
 
@@ -171,7 +219,10 @@ class TestVocabImage(unittest.TestCase):
             for y in range(4, 16):
                 img.putpixel((x, y), (200, 200, 200))
         out = suppress_bleed(img)
-        self.assertLess(sum(out.getpixel((12, 10))) / 3, 40)
-        self.assertGreater(sum(out.getpixel((28, 10))) / 3, 240)
+        dark_pixel = out.getpixel((12, 10))
+        light_pixel = out.getpixel((28, 10))
+        assert isinstance(dark_pixel, tuple) and isinstance(light_pixel, tuple)
+        self.assertLess(sum(dark_pixel) / 3, 40)
+        self.assertGreater(sum(light_pixel) / 3, 240)
         padded = pad_vocab_crop(out, canvas=64, margin=4)
         self.assertEqual(padded.size, (64, 64))

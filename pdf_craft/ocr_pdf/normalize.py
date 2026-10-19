@@ -15,7 +15,7 @@ import re
 
 from ..pdf.ngrams import trim_repetitive_tail
 from ..pdf.types import Page, PageLayout
-from ..sequence.vocab_split import expand_dual_column_vocab_layouts, is_vocab_entry
+from ..sequence.vocab_split import expand_dual_column_vocab_layouts
 from .types import OcrPdfPage, OcrTextLine
 from .vocab_cleanup import (
     cleanup_vocab_lines,
@@ -41,15 +41,6 @@ def pages_to_ocr_pdf_pages(pages: dict[int, Page]) -> list[OcrPdfPage]:
         page = pages[page_index]
         lines: list[OcrTextLine] = []
         text_batch: list[PageLayout] = []
-
-        def flush_text_batch() -> None:
-            if not text_batch:
-                return
-            for layout in order_left_column_then_right(text_batch):
-                text = _clean_text(layout.text)
-                if text:
-                    lines.append(OcrTextLine(text=text, ref=layout.ref or "text"))
-            text_batch.clear()
 
         for layout in page.body_layouts:
             if layout.ref == "image":
@@ -81,7 +72,10 @@ def pages_to_ocr_pdf_pages(pages: dict[int, Page]) -> list[OcrPdfPage]:
             if usable is not None:
                 text_batch.append(usable)
 
-        flush_text_batch()
+        for layout in order_left_column_then_right(text_batch):
+            text = _clean_text(layout.text)
+            if text:
+                lines.append(OcrTextLine(text=text, ref=layout.ref or "text"))
         texts = cleanup_vocab_lines([line.text for line in lines])
         lines = [OcrTextLine(text=text, ref="text") for text in texts]
         result.append(OcrPdfPage(page_index=page_index, lines=lines))
@@ -177,16 +171,23 @@ def split_table_columns(text: str) -> tuple[list[str], list[str]]:
 
     left: list[str] = []
     right: list[str] = []
-    for table_html in _TABLE_BLOCK.findall(value) or [value]:
-        for tr_match in _TR_BLOCK.finditer(table_html):
-            raw_cells = [
-                _clean_cell(cell) for cell in _TD_BLOCK.findall(tr_match.group(1))
-            ]
-            entry_left, entry_right = _row_to_column_entries(raw_cells)
-            if entry_left:
-                left.append(entry_left)
-            if entry_right:
-                right.append(entry_right)
+    offset = 0
+    for tr_match in _TR_BLOCK.finditer(value):
+        surrounding = _clean_cell(value[offset:tr_match.start()])
+        if surrounding:
+            left.append(surrounding)
+        raw_cells = [
+            _clean_cell(cell) for cell in _TD_BLOCK.findall(tr_match.group(1))
+        ]
+        entry_left, entry_right = _row_to_column_entries(raw_cells)
+        if entry_left:
+            left.append(entry_left)
+        if entry_right:
+            right.append(entry_right)
+        offset = tr_match.end()
+    trailing = _clean_cell(value[offset:])
+    if trailing:
+        left.append(trailing)
     return left, right
 
 
@@ -194,15 +195,10 @@ def _row_to_column_entries(cells: list[str]) -> tuple[str | None, str | None]:
     """Map one table row to optional left/right vocab lines."""
     if len(cells) >= 4:
         left = _join_word_pages(cells[0], cells[1])
-        right = _join_word_pages(cells[2], cells[3])
+        right = " ".join(cell for cell in cells[2:] if cell)
         return left or None, right or None
 
     nonempty = [cell for cell in cells if cell]
-    if len(nonempty) >= 4:
-        left = _join_word_pages(nonempty[0], nonempty[1])
-        right = _join_word_pages(nonempty[2], nonempty[3])
-        return left or None, right or None
-
     if len(nonempty) == 2:
         joined = _join_word_pages(nonempty[0], nonempty[1])
         return joined or None, None

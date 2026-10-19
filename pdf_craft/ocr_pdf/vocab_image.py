@@ -6,7 +6,6 @@ import numpy as np
 from PIL.Image import Image
 from PIL import Image as PILImage
 
-_BLANK_INK_MEAN = 3.5
 _MIN_DARK_FRAC = 0.003
 
 
@@ -47,7 +46,12 @@ def is_weak_print(image: Image, box: tuple[int, int, int, int]) -> bool:
     if crop.size[0] < 8 or crop.size[1] < 8:
         return True
     gray = np.asarray(crop.convert("L"), dtype=np.float32)
-    ink = 255.0 - gray
-    if float(ink.mean()) < _BLANK_INK_MEAN:
-        return True
-    return float((gray < 120.0).mean()) < _MIN_DARK_FRAC
+    # Sparse final rows have a low average ink value despite clear dark glyphs.
+    # Decide using dark ink, not the amount of surrounding white space.
+    dark = gray < 120.0
+    if float(dark.mean()) >= _MIN_DARK_FRAC:
+        return False
+    # A short word may occupy very little of a large band. Look for several
+    # ink-bearing rows before treating that band as blank.
+    min_row_pixels = max(3, int(gray.shape[1] * 0.01))
+    return int(np.count_nonzero(dark.sum(axis=1) >= min_row_pixels)) < 3
