@@ -1,0 +1,460 @@
+# pylint: disable=protected-access
+
+import json
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, cast
+from xml.etree import ElementTree
+from zipfile import ZipFile
+
+from epub_generator import BookMeta
+
+from pdf_craft import PDFCraft
+from pdf_craft.document import PDFCraftExtraction
+from pdf_craft.extractor.chapter.chapter import (
+    SourceTextFragment, Chapter, DisplayFormula, TextFlowItem, StandaloneAsset,
+    decode as decode_chapter,
+)
+from pdf_craft.common import save_xml
+from pdf_craft.extractor.chapter.chapter import encode
+from pdf_craft.extractor.toc.types import Toc, TocInfo, encode as encode_toc
+from tests.extraction_helpers import make_extraction
+
+
+class _Identity:
+    async def translate_element(self, task, **_kwargs):
+        return task.element, task.payload
+
+
+class _TranslateHeadline:
+    async def translate_element(self, task, **_kwargs):
+        for element in task.element.iter():
+            if element.text:
+                element.text = element.text.replace("Chapter One", "第一章")
+        return task.element, task.payload
+
+
+def _replace_archive_members(
+    source_path: Path,
+    target_path: Path,
+    replacements: dict[str, bytes],
+) -> None:
+    with ZipFile(source_path) as source, ZipFile(target_path, "w") as target:
+        for info in source.infolist():
+            content = replacements.get(info.filename, source.read(info.filename))
+            target.writestr(info, content)
+
+
+class TestPDFCraftExtraction(unittest.TestCase):
+    def test_furniture_toc_id_must_reference_existing_toc_item(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "workspace", with_toc=True)
+            (root / "workspace" / "furnitures.xml").write_text(
+                "<furnitures><patterns><pattern id='0' kind='universal'>"
+                "<position id='0' toc_id='7'>Unknown</position>"
+                "</pattern></patterns><pages/></furnitures>",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "invalid position"):
+                extraction._validate()
+
+    def test_translation_keeps_furniture_for_the_separate_furniture_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "source"
+            source = make_extraction(
+                workspace,
+                page_pixel_sizes={1: (100, 100)},
+                with_toc=True,
+            )
+            save_xml(
+                encode_toc(TocInfo(
+                    content=[Toc(7, 1, 0, 0, [])], page_indexes=[]
+                )),
+                workspace / "toc.xml",
+            )
+            heading = TextFlowItem(
+                role="heading",
+                level=0,
+                children=[SourceTextFragment(1, 0, (1, 1, 90, 20), ["Chapter One"])],
+            )
+            save_xml(encode(Chapter(7, 0, [heading])), workspace / "chapters/chapter_7.xml")
+            (workspace / "furnitures.xml").write_text(
+                "<furnitures><patterns><pattern id='0' kind='universal'>"
+                "<position id='0' toc_id='7'>Chapter One</position>"
+                "</pattern></patterns><pages><page index='1'>"
+                "<section det='1,30,90,50' toc_id='7'>Chapter One .... 7</section>"
+                "<section det='1,60,90,80'>Unbound</section>"
+                "</page></pages></furnitures>",
+                encoding="utf-8",
+            )
+
+            translated = PDFCraft().translate_extraction(
+                source, root / "translated.pcex", cast(Any, _TranslateHeadline()),
+                target_language="en",
+            )
+            with translated._materialize() as paths:
+                furniture = ElementTree.parse(paths.furnitures).getroot()
+                self.assertEqual(furniture.findtext("patterns/pattern/position"), "Chapter One")
+                sections = furniture.findall("pages/page/section")
+                self.assertEqual(sections[0].text, "Chapter One .... 7")
+                self.assertEqual(sections[1].text, "Unbound")
+    def test_archive_remains_usable_after_analysis_workspace_is_gone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "book.pcex"
+            with tempfile.TemporaryDirectory() as analysis_directory:
+                extraction_root = Path(analysis_directory) / "extraction"
+                extraction = make_extraction(extraction_root)
+                save_xml(
+                    encode(Chapter(None, -1, [])),
+                    extraction_root / "chapters/chapter_head.xml",
+                )
+                extraction._export(archive_path)
+
+            opened = PDFCraftExtraction._open(archive_path)
+            opened._validate()
+            self.assertEqual(opened._page_pixel_sizes(), {1: (100, 100)})
+
+    def test_archive_round_trip_has_only_standard_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            modified = datetime(2025, 1, 2, tzinfo=timezone.utc)
+            extraction = make_extraction(
+                root / "workspace",
+                page_pixel_sizes={1: (1200, 1800), 2: (900, 1400)},
+                render_dpi=240,
+                with_toc=True,
+                book_meta=BookMeta(
+                    title="A book", authors=["Author"], translators=["Translator"],
+                    modified=modified,
+                ),
+                language="en",
+            )
+            save_xml(encode(Chapter(None, -1, [])), root / "workspace/chapters/chapter_head.xml")
+            (root / "workspace/cover.png").write_bytes(b"cover")
+            asset_name = "a" * 64 + ".png"
+            (root / "workspace/assets" / asset_name).write_bytes(b"asset")
+            archive_path = root / "book.pcex"
+
+            opened = extraction._export(archive_path)
+
+            self.assertEqual(opened._page_pixel_sizes(), {1: (1200, 1800), 2: (900, 1400)})
+            self.assertEqual(PDFCraftExtraction._open(archive_path)._render_dpi(), 240)
+            self.assertEqual(opened._render_dpi(), 240)
+            self.assertEqual(opened._language(), "en")
+            metadata = opened._book_meta()
+            assert metadata is not None
+            self.assertEqual(metadata.title, "A book")
+            self.assertEqual(metadata.authors, ["Author"])
+            self.assertEqual(metadata.modified, modified)
+            with ZipFile(archive_path) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {
+                        "manifest.json", "pages.xml", "toc.xml", "cover.png",
+                        "chapters/", "chapters/chapter_head.xml",
+                        "assets/", f"assets/{asset_name}",
+                    },
+                )
+
+    def test_folder_and_non_pcex_paths_are_not_public_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_extraction(root / "workspace")
+            with self.assertRaisesRegex(ValueError, "\\.pcex"):
+                PDFCraftExtraction._open(root / "workspace")
+            (root / "book.zip").write_bytes(b"not a zip")
+            with self.assertRaisesRegex(ValueError, "\\.pcex"):
+                PDFCraftExtraction._open(root / "book.zip")
+
+    def test_corrupt_and_unsafe_archives_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corrupt = root / "corrupt.pcex"
+            corrupt.write_bytes(b"not a zip")
+            with self.assertRaisesRegex(ValueError, "invalid or corrupt"):
+                PDFCraftExtraction._open(corrupt)
+
+            unsafe = root / "unsafe.pcex"
+            with ZipFile(unsafe, "w") as archive:
+                archive.writestr("../manifest.json", "{}")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                PDFCraftExtraction._open(unsafe)
+
+    def test_missing_component_and_unsupported_version_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "workspace")
+            extraction._export(root / "valid.pcex")
+
+            missing = root / "missing.pcex"
+            with ZipFile(root / "valid.pcex") as source, ZipFile(missing, "w") as target:
+                for info in source.infolist():
+                    if info.filename != "pages.xml":
+                        target.writestr(info, source.read(info.filename))
+            with self.assertRaisesRegex(ValueError, "pages.xml"):
+                PDFCraftExtraction._open(missing)
+
+            unsupported = root / "unsupported.pcex"
+            with ZipFile(root / "valid.pcex") as source, ZipFile(unsupported, "w") as target:
+                for info in source.infolist():
+                    content = source.read(info.filename)
+                    if info.filename == "manifest.json":
+                        payload = json.loads(content)
+                        payload["format_version"] = 999
+                        content = json.dumps(payload).encode()
+                    target.writestr(info, content)
+            with self.assertRaisesRegex(ValueError, "format version"):
+                PDFCraftExtraction._open(unsupported)
+
+    def test_invalid_manifest_json_and_incomplete_document_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "workspace")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+
+            invalid_json = root / "invalid-json.pcex"
+            _replace_archive_members(
+                valid,
+                invalid_json,
+                {"manifest.json": b"{"},
+            )
+            with self.assertRaisesRegex(ValueError, "invalid PDFCraftExtraction manifest.json"):
+                PDFCraftExtraction._open(invalid_json)
+
+            incomplete = root / "incomplete-document.pcex"
+            with ZipFile(valid) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+            manifest["document"] = {}
+            _replace_archive_members(
+                valid,
+                incomplete,
+                {"manifest.json": json.dumps(manifest).encode()},
+            )
+            with self.assertRaisesRegex(ValueError, "invalid document metadata"):
+                PDFCraftExtraction._open(incomplete)
+
+    def test_invalid_narrative_xml_and_schema_are_rejected_when_opened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+
+            cases = {
+                "malformed": (b"<chapter>", "invalid PDFCraftExtraction XML"),
+                "missing-body": (b"<chapter/>", "invalid chapter schema"),
+            }
+            for name, (narrative_xml, error_pattern) in cases.items():
+                with self.subTest(name=name):
+                    invalid = root / f"{name}.pcex"
+                    _replace_archive_members(
+                        valid,
+                        invalid,
+                        {"chapters/chapter_head.xml": narrative_xml},
+                    )
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        PDFCraftExtraction._open(invalid)
+
+    def test_invalid_toc_xml_and_schema_are_rejected_when_opened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "workspace", with_toc=True)
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+            cases = {
+                "malformed": (b"<toc>", "invalid PDFCraftExtraction XML: toc.xml"),
+                "missing-page-indexes": (b"<toc/>", "invalid toc schema"),
+            }
+            for name, (toc_xml, error_pattern) in cases.items():
+                with self.subTest(name=name):
+                    invalid = root / f"invalid-toc-{name}.pcex"
+                    _replace_archive_members(valid, invalid, {"toc.xml": toc_xml})
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        PDFCraftExtraction._open(invalid)
+
+    def test_noncanonical_asset_hash_cannot_escape_assets_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            (workspace / "cover.png").write_bytes(b"cover")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+            invalid = root / "invalid-hash.pcex"
+            narrative_xml = (
+                b'<chapter><flow><standalone-asset><asset ref="image" page_index="1" '
+                b'bbox="0,0,1,1" asset_hash="../cover"/></standalone-asset></flow></chapter>'
+            )
+            _replace_archive_members(
+                valid,
+                invalid,
+                {"chapters/chapter_head.xml": narrative_xml},
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid asset hash"):
+                PDFCraftExtraction._open(invalid)
+
+    def test_valid_v3_archive_is_readable_and_exports_as_v4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            current = root / "current.pcex"
+            extraction._export(current)
+            with ZipFile(current) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+            manifest["format_version"] = 3
+            legacy = root / "v3.pcex"
+            _replace_archive_members(
+                current, legacy, {"manifest.json": json.dumps(manifest).encode("utf-8")},
+            )
+
+            opened = PDFCraftExtraction._open(legacy)
+            normalized = root / "normalized.pcex"
+            opened._export(normalized)
+            with ZipFile(normalized) as archive:
+                self.assertEqual(json.loads(archive.read("manifest.json"))["format_version"], 4)
+                self.assertNotIn("translations/index.json", archive.namelist())
+
+    def test_v3_archive_rejects_legacy_reference_flow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+            invalid = root / "legacy-reference.pcex"
+            narrative_xml = (
+                b'<chapter><flow/><references><ref id="1-1"><mark>1</mark><flow>'
+                b'<display-formula><asset ref="equation" page_index="1" bbox="0,0,1,1"/>'
+                b'</display-formula></flow></ref></references></chapter>'
+            )
+            _replace_archive_members(valid, invalid, {"chapters/chapter_head.xml": narrative_xml})
+            with self.assertRaisesRegex(ValueError, "legacy 'equation'"):
+                PDFCraftExtraction._open(invalid)
+
+    def test_v3_archive_rejects_legacy_asset_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+            invalid = root / "legacy-attributes.pcex"
+            narrative_xml = (
+                b'<chapter><flow><standalone-asset><asset ref="image" page_index="1" '
+                b'det="0,0,1,1" hash="a"/></standalone-asset></flow></chapter>'
+            )
+            _replace_archive_members(valid, invalid, {"chapters/chapter_head.xml": narrative_xml})
+            with self.assertRaisesRegex(ValueError, "unsupported attributes"):
+                PDFCraftExtraction._open(invalid)
+
+    def test_v3_archive_rejects_unknown_and_legacy_fragment_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+            invalid = root / "legacy-fragment-attributes.pcex"
+            narrative_xml = (
+                b'<chapter><flow><text role="body"><fragment '
+                b'page_index="1" source_order="0" order="1" bbox="0,0,1,1" '
+                b'det="0,0,9,9">text</fragment></text></flow></chapter>'
+            )
+            _replace_archive_members(valid, invalid, {"chapters/chapter_head.xml": narrative_xml})
+            with self.assertRaisesRegex(ValueError, "unsupported attributes"):
+                PDFCraftExtraction._open(invalid)
+
+    def test_v1_and_v2_archives_migrate_flat_assets_to_current_flow_items(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            extraction = make_extraction(workspace)
+            save_xml(encode(Chapter(None, -1, [])), workspace / "chapters/chapter_head.xml")
+            valid = root / "valid.pcex"
+            extraction._export(valid)
+            legacy_chapter = (
+                b'<chapter><body><paragraph ref="text"><block page_index="1" order="0" '
+                b'det="0,0,90,20">before</block></paragraph><paragraph ref="sidebar">'
+                b'<block page_index="1" order="1" det="0,21,90,40">legacy note</block>'
+                b'</paragraph><asset ref="image" '
+                b'page_index="1" det="0,22,90,60"/><asset ref="equation" page_index="1" '
+                b'det="0,62,90,80"><content>x^2</content></asset></body></chapter>'
+            )
+            with ZipFile(valid) as archive:
+                source_manifest = json.loads(archive.read("manifest.json"))
+            for version in (1, 2):
+                manifest = dict(source_manifest, format_version=version)
+                if version == 1:
+                    manifest["document"] = {
+                        "title": None, "description": None, "publisher": None, "isbn": None,
+                        "authors": [], "editors": [], "translators": [], "modified": None,
+                        "language": None,
+                    }
+                archive_path = root / f"v{version}.pcex"
+                _replace_archive_members(valid, archive_path, {
+                    "manifest.json": json.dumps(manifest).encode(),
+                    "chapters/chapter_head.xml": legacy_chapter,
+                })
+                opened = PDFCraftExtraction._open(archive_path)
+                with opened._materialize() as paths:
+                    migrated = decode_chapter(ElementTree.parse(paths.chapters / "chapter_head.xml").getroot())
+                self.assertIsInstance(migrated.flow_items[1], TextFlowItem)
+                assert isinstance(migrated.flow_items[1], TextFlowItem)
+                self.assertEqual(migrated.flow_items[1].role, "body")
+                self.assertEqual(migrated.flow_items[1].children[0].content, ["legacy note"])
+                self.assertIsInstance(migrated.flow_items[2], StandaloneAsset)
+                self.assertIsInstance(migrated.flow_items[3], DisplayFormula)
+                normalized_path = root / f"v{version}-normalized.pcex"
+                opened._export(normalized_path)
+                with ZipFile(normalized_path) as archive:
+                    normalized_manifest = json.loads(archive.read("manifest.json"))
+                    normalized_chapter = ElementTree.fromstring(
+                        archive.read("chapters/chapter_head.xml")
+                    )
+                self.assertEqual(normalized_manifest["format_version"], 4)
+                self.assertIsNotNone(normalized_chapter.find("flow"))
+                self.assertIsNone(normalized_chapter.find("body"))
+                self.assertEqual(normalized_chapter.findall("flow/text")[1].get("role"), "body")
+
+    def test_translation_preserves_manifest_pages_toc_cover_and_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_workspace = root / "source"
+            source = make_extraction(
+                source_workspace,
+                page_pixel_sizes={1: (20, 30)},
+                with_toc=True,
+                book_meta=BookMeta(title="Metadata"),
+                language="zh",
+            )
+            save_xml(encode(Chapter(None, -1, [])), source_workspace / "chapters/chapter_head.xml")
+            (source_workspace / "cover.png").write_bytes(b"cover")
+            asset_name = "b" * 64 + ".png"
+            (source_workspace / "assets" / asset_name).write_bytes(b"asset")
+
+            translated = PDFCraft().translate_extraction(
+                source, root / "translated.pcex", cast(Any, _Identity()),
+                target_language="en",
+            )
+
+            with source._materialize() as original, translated._materialize() as result:
+                for name in ("manifest.json", "pages.xml", "toc.xml", "cover.png"):
+                    self.assertEqual((original.root / name).read_bytes(),
+                                     (result.root / name).read_bytes())
+                self.assertEqual((original.assets / asset_name).read_bytes(),
+                                 (result.assets / asset_name).read_bytes())

@@ -10,7 +10,9 @@ pdf-craft 可以直接翻译已有 EPUB。输入已经是 EPUB 时，不需要 O
 文本 LLM 配置，并指定输入文件、输出文件、目标语言和译文提交模式：
 
 ~~~python
-from pdf_craft import LLM, PDFCraft, SubmitKind
+from pdf_craft import (
+    ConcurrentExecutor, FixedCapacity, LLM, PDFCraft, SubmitKind,
+)
 
 llm = LLM(
     key="your-api-key",
@@ -18,6 +20,7 @@ llm = LLM(
     model="gpt-4.1-mini",
     token_encoding="o200k_base",
 )
+executor = ConcurrentExecutor(FixedCapacity(4))
 
 PDFCraft().translate_epub(
     "source.epub",
@@ -25,6 +28,7 @@ PDFCraft().translate_epub(
     target_language="zh",
     submit=SubmitKind.APPEND_BLOCK,
     llm=llm,
+    executor=executor,
 )
 ~~~
 
@@ -42,7 +46,7 @@ PDFCraft().translate_epub(
 | `SubmitKind.APPEND_TEXT` | 将译文直接接在原文后面 | 希望在同一段落中连续阅读双语文本 |
 | `SubmitKind.APPEND_BLOCK` | 将译文作为独立文本块追加到原文后 | 双语对照阅读，通常最清晰 |
 
-章节正文会严格按照所选模式提交。目录和可翻译的书籍元数据也会翻译；在 `APPEND_BLOCK` 模式下，
+章节正文会严格按照所选模式提交。目录、XHTML 文档标题和可翻译的书籍元数据也会翻译；EPUB 2 的 NCX `docTitle` 跟随翻译后的书名，`dc:language` 直接写为 `target_language`。在 `APPEND_BLOCK` 模式下，
 为了保持目录和元数据的结构可用，它们的译文会以内联方式接在原文后，而不是创建新的目录
 或元数据块。
 
@@ -53,12 +57,14 @@ PDFCraft().translate_epub(
 PDFCraft().translate_epub(
     "source.epub", "translated.zh.epub",
     target_language="zh", submit=SubmitKind.REPLACE, llm=llm,
+    executor=executor,
 )
 
 # 双语：原文保留，译文按独立文本块追加
 PDFCraft().translate_epub(
     "source.epub", "bilingual.zh.epub",
     target_language="zh", submit=SubmitKind.APPEND_BLOCK, llm=llm,
+    executor=executor,
 )
 ~~~
 
@@ -119,6 +125,7 @@ PDFCraft().translate_epub(
     submit=SubmitKind.APPEND_BLOCK,
     translation_llm=translation_llm,
     fill_llm=fill_llm,
+    executor=executor,
 )
 ~~~
 
@@ -135,24 +142,22 @@ PDFCraft().translate_epub(
     target_language="zh",
     submit=SubmitKind.APPEND_BLOCK,
     llm=llm,
+    executor=executor,
     user_prompt="使用正式书面语，保留人名、专业术语和脚注编号。",
 )
 ~~~
 
 ### 重试与分组大小
 
-- `max_retries` 只控制 XML 结构修复循环允许的最大总尝试次数，默认值为 5；因此默认最多
-  包含 4 次重试。它不限制文本翻译请求，后者由 LLM 的 `retry_times` 控制。
-- `max_group_tokens` 控制一次提交给翻译器的文本分组大小，默认值为 2600。增大它可以
-  减少请求次数，但会增加单次请求的上下文和失败重试成本。
-- LLM 配置中的 `retry_times` 控制文本翻译请求遇到网络错误或空响应时的额外重试次数；默认
-  值 5 表示首次请求加最多 5 次重试（最多 6 次尝试）。它和 `max_retries` 处于不同层次。
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
 
 ### 并发翻译
 
-`concurrency` 控制同时处理的翻译任务数，默认值为 1。建议先使用默认值确认服务可用，
-再根据供应商的速率限制逐步提高。输出顺序会保持稳定，但并发提高会增加同时进行的请求数
-和服务费用：
+`executor` 控制真实 LLM 请求共享的供应商容量。翻译和 XML 修复若使用同一供应商配额，
+应复用同一个执行器。`window` 默认值为 1，限制在途翻译 group 的数量。某个 group 完成后即释放
+执行名额，即使更早的结果仍未返回；已完成结果在磁盘等待有序交付。执行器独立限制真实供应商
+请求容量。XML 预取只使用 `window`，供应商容量必须通过执行器显式提供。
+两个模型使用不同配额时，可分别传 `translation_executor` 与 `fill_executor`：
 
 ~~~python
 PDFCraft().translate_epub(
@@ -160,7 +165,8 @@ PDFCraft().translate_epub(
     target_language="zh",
     submit=SubmitKind.APPEND_BLOCK,
     llm=llm,
-    concurrency=4,
+    executor=executor,
+    window=4,
 )
 ~~~
 
@@ -188,11 +194,11 @@ llm = LLM(
 
 ## 进度与失败回调
 
-`on_translation_event` 接收底层 `TranslationEvent` 事件，报告翻译范围以及 TOC、metadata、
-chapter item 的开始、完成和源文本字符统计。字符统计不是 token，也不是固定比例。相同回调
-也适用于 package 和 PDF 翻译流程。
+`on_translation_event` 使用原文 **words**，首次模型调用前预统计全书总量，每轮翻译最终
+处理后报告 PROGRESS。统一计数和事件字段见[翻译进度](TRANSLATION_PROGRESS.md)，与
+PCEX/PDF 翻译共用。
 
-`on_fill_failed` 接收 `FillFailedEvent`。它描述 XML 结构修复过程中发生的错误：
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
 
 - `error_message`：错误消息。
 - `retried_count`：当前已尝试的次数。
@@ -200,37 +206,42 @@ chapter item 的开始、完成和源文本字符统计。字符统计不是 tok
   一个 `False` 事件；最后一次耗尽上限的事件为 `True`，此时错误可能影响最终 EPUB，应记录
   并检查输出。
 
-~~~python
-from pdf_craft import FillFailedEvent, TranslationEventKind
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
 
 def on_translation_event(event) -> None:
-    if event.kind == TranslationEventKind.PROGRESS:
-        print(event.completed_characters, event.total_characters)
+    if event.kind == ProgressEventKind.PROGRESS:
+        print(event.unit_id, event.stage, event.unit_completed_words, event.completed_words)
 
-def on_fill_failed(event: FillFailedEvent) -> None:
-    if event.over_maximum_retries:
-        print(f"未恢复的结构修复错误：{event.error_message}")
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
 
-PDFCraft().translate_epub(
-    "source.epub", "translated.epub",
-    target_language="zh",
-    submit=SubmitKind.APPEND_BLOCK,
-    llm=llm,
-    on_translation_event=on_translation_event,
-    on_fill_failed=on_fill_failed,
-)
-~~~
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
 
 ## 输入、输出与限制
 
-- 输入必须是可读取的 EPUB 文件，输出路径应与输入路径不同。
-- pdf-craft 会迁移 EPUB 压缩包中的 `mimetype`，并按书籍 spine 处理章节。
-- 目录和部分书籍元数据会参与翻译。`language`、`identifier`、`date`、`meta`、`contributor`
-  字段属于技术或标识信息，会被明确跳过，不会发送给 LLM；其他包含文本的元数据字段才会
-  进入翻译流程。如果 TOC 文件存在但没有条目，目录阶段会没有任务并由其他内容继续；如果
-  EPUB 根本没有可识别的 TOC 文件，当前实现会直接报错，而不是跳过该阶段。
-- `APPEND_BLOCK` 适用于章节正文的双语排版；目录和元数据仍使用内联追加，以保持 EPUB
-  结构。
-- EPUB 翻译只处理文本和相关 XML 结构，不会重新 OCR，也不会把 PDF 写回 PDF。
-- 目标文件生成过程中发生不可恢复错误时，应检查 `on_fill_failed` 报告和日志目录，并使用
-  新的输出路径重新运行；不要把未完成的输出当作完整译本。
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
+
+
+## 在完整 EPUB 生成前获取译文
+
+`on_body` 接收 `EpubFragmentContent(epubcfi, original, translated)`。它对应已采纳的原子翻译
+片段，可能比一个自然段更小；原译文均为纯文本，不包含 LLM 窗口重叠的上下文。
+可选范围 CFI 定位原始输入 EPUB，不指向译文文件。`epubcfi` 类型为 `str | None`：XHTML
+保留精确定位，`text/html` 或明确缺少可靠来源信息时使用 `None`，原译文仍正常交付。
+混合格式书籍的其他片段保留可靠 CFI，调用方使用定位前应判断是否为 `None`。
+仅降级明确的定位能力缺失；解析、翻译、意外映射错误及用户回调异常仍传播。
+支持从嵌套 OPF 通过 `../` 等相对路径定位章节。
+
+`on_metadata` 一次性交付 OPF 书籍元信息的完整 `MetadataContent`。双语模式中，回调依然将
+译文视图与原文分开，最终 EPUB 保留所选追加方式。正文回调不包含导航、文档 head/title 或
+书籍元信息。
+
+两条回调均可选，支持同步或异步函数；异步回调会被等待，异常会终止操作。输出 EPUB 只在
+成功后以完整文件提交。示例、CFI 定位、顺序及来源有效期见[增量回调指南](STREAMING.md)。
+
+
+统一策略、默认严格失败和全局全部降级的规则见 [错误处理](ERROR_HANDLING.md)。
+
+LLM 暂时限流由 executor 的 `RateLimitScope` 恢复，不消耗 `LLM.retry_times`。
+共享配额、冷却及等待上限见 [共享限流范围](API_REFERENCE.md#共享限流范围)。
+
+统一事件、单元计数和 stage 编号见[进度协议](TRANSLATION_PROGRESS.md)。

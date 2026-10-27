@@ -1,3 +1,6 @@
+# pylint: disable=protected-access
+
+import asyncio
 import json
 import tempfile
 import unittest
@@ -6,13 +9,13 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-from pdf_craft.document import DocumentPackage
+from pdf_craft.document import ExtractionPaths, PDFCraftExtraction
 from pdf_craft.extractor import PDFExtractor
 from pdf_craft.common import save_xml
 from pdf_craft.markdown.render import render_markdown_file
 from pdf_craft.metering import OCRTokensMetering
 from pdf_craft.ocr_config import OCRConfig
-from pdf_craft.pdf import OCREvent, OCREventKind
+from pdf_craft.progress import ProgressEvent, ProgressEventKind, OperationKind, UnitKind, UnitOutcome
 from pdf_craft_tool.smoke.assets import discover_assets
 from pdf_craft_tool.smoke.checks import check_epub, check_markdown, check_pdf_patch_geometry
 from pdf_craft_tool.smoke.runner import (
@@ -24,7 +27,8 @@ from pdf_craft_tool.smoke.runner import (
     expand_matrix,
     run_smoke,
 )
-from pdf_craft.extractor.chapter.chapter import AssetLayout, BlockLayout, Chapter, ParagraphLayout, encode
+from pdf_craft.extractor.chapter.chapter import SourceAsset, SourceTextFragment, Chapter, StandaloneAsset, TextFlowItem, encode
+from tests.extraction_helpers import make_extraction
 
 encode_chapter = encode
 
@@ -33,25 +37,28 @@ class _CaptureTransform:
     def __init__(self):
         self.kwargs = None
 
-    def extract_package(self, *, analysing_path, **kwargs):
+    async def extract_package_async(self, *, analysing_path, **kwargs):
         self.kwargs = kwargs
-        (analysing_path / "chapters").mkdir(parents=True)
-        (analysing_path / "assets").mkdir()
-        (analysing_path / "toc.xml").write_text("<toc/>")
-        DocumentPackage.from_path(analysing_path).write_metadata(page_pixel_sizes={1: (1, 1)})
+        make_extraction(
+            analysing_path / "extraction", page_pixel_sizes={1: (1, 1)}, with_toc=True
+        )
         return None, None, None, None, None
 
 
 class TestSmokeMatrix(unittest.TestCase):
     def test_discovers_pdf_and_migrated_epub_assets(self):
         assets = discover_assets(Path("tests/assets"))
-        self.assertIn("double_column.pdf", {asset.name for asset in assets})
+        self.assertIn("pdf/double_column.pdf", {asset.name for asset in assets})
         self.assertIn("epub/Cambridge.epub", {asset.name for asset in assets})
+        self.assertIn(
+            "analysis/citation_large_ocr",
+            {asset.name for asset in assets if asset.format == "ocr-pages"},
+        )
 
     def test_expands_config_without_fixed_profiles(self):
         runs = expand_matrix(
             {"defaults": {"page_indexes": [1], "ocr_size": "tiny"}, "runs": [
-                {"asset": "double_column.pdf", "route": "markdown", "backend": "deepseek-ocr-local"},
+                {"asset": "pdf/double_column.pdf", "route": "markdown", "backend": "deepseek-ocr-local"},
                 {"asset": "epub/Cambridge.epub", "route": "epub-check"},
             ]},
             Path("tests/assets"),
@@ -62,18 +69,56 @@ class TestSmokeMatrix(unittest.TestCase):
     def test_expands_package_renderer_routes_for_pdf_assets(self):
         runs = expand_matrix(
             {"runs": [
-                {"asset": "citation.pdf", "route": "package-markdown"},
-                {"asset": "citation.pdf", "route": "package-epub"},
+                {"asset": "pdf/citation.pdf", "route": "package-markdown"},
+                {"asset": "pdf/citation.pdf", "route": "package-epub"},
             ]},
             Path("tests/assets"),
         )
         self.assertEqual([run.route for run in runs], ["package-markdown", "package-epub"])
 
+    def test_expands_cached_page_repair_route(self):
+        runs = expand_matrix(
+            {"runs": [{
+                "asset": "analysis/citation_large_ocr",
+                "route": "page-repair",
+                "page_repair": {
+                    "jev_baseline": "tests/assets/analysis/citation_large_jev_baseline.json",
+                    "expected": "tests/assets/analysis/citation_large_page_repair_expected.json",
+                    "llm_profile": "default",
+                },
+            }]},
+            Path("tests/assets"),
+        )
+        self.assertEqual(runs[0].route, "page-repair")
+        page_repair = runs[0].page_repair
+        assert page_repair is not None
+        self.assertEqual(page_repair["llm_profile"], "default")
+
+    def test_cached_page_repair_route_writes_standard_smoke_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "pdf_craft_tool.smoke.runner.run_page_repair_smoke",
+                return_value=("passed", [], {"page_repair": {"attempts": {"2": 1}}}),
+            ) as execute:
+                run_path = run_smoke(
+                    SmokeRun(
+                        "analysis/citation_large_ocr",
+                        "page-repair",
+                        page_repair={"llm": {"key": "secret"}},
+                    ),
+                    assets_root=Path("tests/assets"),
+                    output_root=Path(directory),
+                )
+                manifest = json.loads((run_path / "manifest.json").read_text())
+                self.assertEqual(manifest["status"], "passed")
+                self.assertEqual(manifest["page_repair"]["attempts"], {"2": 1})
+                execute.assert_called_once()
+
     def test_dry_run_writes_isolated_plan_and_redacts_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             run_path = run_smoke(
-                SmokeRun("double_column.pdf", "package", "deepseek-ocr-vendor", ocr={"api_key": "secret"}),
+                SmokeRun("pdf/double_column.pdf", "package", "deepseek-ocr-vendor", ocr={"api_key": "secret"}),
                 assets_root=Path("tests/assets"), output_root=root, dry_run=True,
             )
             manifest = json.loads((run_path / "manifest.json").read_text())
@@ -88,6 +133,7 @@ class TestSmokeMatrix(unittest.TestCase):
             "deepseek": {"api_key": "key", "max_tokens": 1200},
             "unlimited": [{"ak": "access", "sk": "secret", "max_ocr_tokens": 900}],
             "nested": {"access_key": "access", "secret_key": "secret", "password": "pw"},
+            "translation": {"llm": {"key": "llm-secret"}},
         }
         redacted = _redact(value)
         self.assertEqual(redacted["deepseek"]["api_key"], "[redacted]")
@@ -96,6 +142,7 @@ class TestSmokeMatrix(unittest.TestCase):
         self.assertEqual(redacted["nested"]["access_key"], "[redacted]")
         self.assertEqual(redacted["nested"]["secret_key"], "[redacted]")
         self.assertEqual(redacted["nested"]["password"], "[redacted]")
+        self.assertEqual(redacted["translation"]["llm"]["key"], "[redacted]")
         self.assertEqual(_redact({"cache_path": Path("models-cache")})["cache_path"], str(Path("models-cache")))
         self.assertEqual(redacted["deepseek"]["max_tokens"], 1200)
         self.assertEqual(redacted["unlimited"][0]["max_ocr_tokens"], 900)
@@ -105,8 +152,8 @@ class TestSmokeMatrix(unittest.TestCase):
             root = Path(directory)
             package = _package_with_image(root / "package")
             markdown = root / "output" / "book.md"
-            render_markdown_file(package.chapters_path, package.assets_path, markdown,
-                                 Path("assets"), package.cover_path, lambda: False)
+            asyncio.run(render_markdown_file(package.chapters, package.assets, markdown,
+                                 Path("assets"), package.cover, lambda: False))
             self.assertTrue((root / "output" / "assets" / "image.png").is_file())
             self.assertTrue((root / "output" / "assets" / "cover.png").is_file())
             self.assertIn("![](assets/image.png)", markdown.read_text())
@@ -118,8 +165,8 @@ class TestSmokeMatrix(unittest.TestCase):
             package = _package_with_image(root / "package")
             markdown = root / "output" / "book.md"
             destination = root / "external-assets"
-            render_markdown_file(package.chapters_path, package.assets_path, markdown,
-                                 destination, None, lambda: False)
+            asyncio.run(render_markdown_file(package.chapters, package.assets, markdown,
+                                 destination, None, lambda: False))
             self.assertTrue((destination / "image.png").is_file())
             self.assertIn("![](../external-assets/image.png)", markdown.read_text())
             self.assertEqual(check_markdown(markdown), [])
@@ -129,8 +176,8 @@ class TestSmokeMatrix(unittest.TestCase):
             root = Path(directory)
             package = _package_without_assets(root / "package")
             markdown = root / "output" / "book.md"
-            render_markdown_file(package.chapters_path, package.assets_path, markdown,
-                                 Path("assets"), None, lambda: False)
+            asyncio.run(render_markdown_file(package.chapters, package.assets, markdown,
+                                 Path("assets"), None, lambda: False))
             self.assertEqual(check_markdown(markdown), [])
 
     def test_markdown_check_skips_urls_and_protocol_relative_links(self):
@@ -146,30 +193,32 @@ class TestSmokeMatrix(unittest.TestCase):
     def test_pdf_run_records_ocr_events_and_stage_timeline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = _package_without_assets(root / "fixture-package")
+            package_paths = _package_without_assets(root / "fixture-package")
+            package = PDFCraftExtraction._from_workspace(package_paths.root)
             metering = OCRTokensMetering(5, 7)
             with patch("pdf_craft_tool.smoke.runner.PDFCraft") as craft_class:
                 craft = craft_class.return_value
-                def extract(_source, _path, options):
-                    options.on_ocr_event(OCREvent(OCREventKind.COMPLETE, 1, 1, 12, 5, 7))
+                def extract(_source, _path, options, **_kwargs):
+                    options.on_extraction_event(ProgressEvent(ProgressEventKind.COMPLETED, OperationKind.EXTRACTION,
+                        unit_id=0, unit_kind=UnitKind.PAGE, page_index=1, stage=5, outcome=UnitOutcome.PROCESSED))
                     return package, metering
                 craft.extract_pdf_with_metering.side_effect = extract
                 run_path = run_smoke(
-                    SmokeRun("double_column.pdf", "package", "deepseek-ocr-local", ocr={}),
+                    SmokeRun("pdf/double_column.pdf", "package", "deepseek-ocr-local", ocr={}),
                     assets_root=Path("tests/assets"), output_root=root,
                 )
             manifest = json.loads((run_path / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "passed")
             self.assertEqual([item["stage"] for item in manifest["timeline"]],
                              ["configure", "extract", "render", "check", "finish"])
-            self.assertEqual(manifest["ocr_events"], [{"kind": "complete", "page_index": 1,
-                "total_pages": 1, "cost_time_ms": 12, "input_tokens": 5, "output_tokens": 7}])
+            self.assertEqual(manifest["ocr_events"], [{"kind": "completed", "unit_id": 0, "unit_kind": "PAGE", "page_index": 1,
+                "stage": 5, "outcome": "PROCESSED"}])
 
     def test_failed_configuration_records_stage_and_traceback_path(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch("pdf_craft_tool.smoke.runner.create_ocr_config", side_effect=ValueError("bad OCR")):
                 run_path = run_smoke(
-                    SmokeRun("double_column.pdf", "package", "deepseek-ocr-vendor", ocr={"api_key": "secret"}),
+                    SmokeRun("pdf/double_column.pdf", "package", "deepseek-ocr-vendor", ocr={"api_key": "secret"}),
                     assets_root=Path("tests/assets"), output_root=Path(directory),
                 )
             manifest = json.loads((run_path / "manifest.json").read_text())
@@ -185,16 +234,18 @@ class TestSmokeMatrix(unittest.TestCase):
                  patch("pdf_craft_tool.smoke.runner.PDFCraft") as craft_class:
                 craft = craft_class.return_value
 
-                def extract(_source, _path, options):
-                    options.on_ocr_event(OCREvent(
-                        OCREventKind.FAILED, 1, 1,
-                        error=ValueError("OCR rejected api-secret and access-secret"),
-                    ))
+                def extract(_source, _path, options, **_kwargs):
+                    options.on_extraction_event(ProgressEvent(ProgressEventKind.COMPLETED, OperationKind.EXTRACTION,
+                        unit_id=0, unit_kind=UnitKind.PAGE, page_index=1, outcome=UnitOutcome.FALLBACK))
                     raise ValueError("request failed with signing-secret")
 
                 craft.extract_pdf_with_metering.side_effect = extract
                 run_path = run_smoke(
-                    SmokeRun("double_column.pdf", "package", "deepseek-ocr-vendor", ocr=secrets),
+                    SmokeRun(
+                        "pdf/double_column.pdf", "package", "deepseek-ocr-vendor",
+                        ocr=secrets,
+                        translation={"llm": {"key": "translation-secret"}},
+                    ),
                     assets_root=Path("tests/assets"), output_root=Path(directory),
                 )
             persisted = "\n".join((run_path / name).read_text() for name in (
@@ -203,6 +254,7 @@ class TestSmokeMatrix(unittest.TestCase):
             self.assertNotIn("api-secret", persisted)
             self.assertNotIn("access-secret", persisted)
             self.assertNotIn("signing-secret", persisted)
+            self.assertNotIn("translation-secret", persisted)
             self.assertIn("[redacted]", persisted)
 
     def test_epub_check_copies_and_validates_real_fixture(self):
@@ -259,7 +311,9 @@ class TestSmokeMatrix(unittest.TestCase):
     def test_page_indexes_are_forwarded_to_public_extractor(self):
         with tempfile.TemporaryDirectory() as directory:
             transform = _CaptureTransform()
-            PDFExtractor(transform).extract(Path("source.pdf"), Path(directory), page_indexes=(2, 4))
+            asyncio.run(PDFExtractor(transform).extract(
+                Path("source.pdf"), Path(directory) / "book.pcex", page_indexes=(2, 4)
+            ))
             kwargs = transform.kwargs
             assert kwargs is not None
             self.assertEqual(kwargs["page_indexes"], (2, 4))
@@ -267,12 +321,9 @@ class TestSmokeMatrix(unittest.TestCase):
     def test_pdf_patch_geometry_rejects_partial_page_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = DocumentPackage.from_path(root)
-            package.chapters_path.mkdir()
-            package.assets_path.mkdir()
-            package.write_metadata(page_pixel_sizes={1: (100, 100)})
-            chapter = Chapter(None, -1, [ParagraphLayout("text", 0, [
-                BlockLayout(2, 1, (1, 1, 20, 20), ["will be replaced"])
+            package = make_extraction(root, page_pixel_sizes={1: (100, 100)})
+            chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+                SourceTextFragment(2, 1, (1, 1, 20, 20), ["will be replaced"])
             ])])
             with patch("pdf_craft_tool.smoke.checks.create_chapters_reader", return_value=lambda: iter([chapter])):
                 errors = check_pdf_patch_geometry(package)
@@ -281,7 +332,7 @@ class TestSmokeMatrix(unittest.TestCase):
     def test_pdf_route_skips_when_local_ocr_has_no_cuda_device(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "package").mkdir()
+            (root / "analysis").mkdir()
             (root / "output").mkdir()
 
             class UnavailableCraft:
@@ -291,8 +342,8 @@ class TestSmokeMatrix(unittest.TestCase):
                     except RuntimeError as cause:
                         raise ValueError("OCR extraction failed") from cause
 
-            run = SmokeRun("double_column.pdf", "markdown")
-            asset = SmokeAsset("double_column.pdf", "pdf", Path("source.pdf"))
+            run = SmokeRun("pdf/double_column.pdf", "markdown")
+            asset = SmokeAsset("pdf/double_column.pdf", "pdf", Path("source.pdf"))
             with patch("pdf_craft_tool.smoke.runner.PDFCraft", return_value=UnavailableCraft()):
                 status, errors, details = _run_pdf(run, asset, root, cast(OCRConfig, None))
             self.assertEqual(status, "skipped")
@@ -300,29 +351,27 @@ class TestSmokeMatrix(unittest.TestCase):
                 errors,
                 ["OCR backend unavailable: local OCR requires CUDA, but no CUDA device is available"],
             )
-            self.assertEqual(details["package"], str(root / "package"))
+            self.assertEqual(details["package"], str(root / "book.pcex"))
 
     def test_markdown_route_inserts_deterministic_package_step(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "output").mkdir()
-            package_path = root / "package"
-            package_path.joinpath("chapters").mkdir(parents=True)
-            package_path.joinpath("assets").mkdir()
-            package_path.joinpath("toc.xml").write_text("<toc />")
-            package = DocumentPackage.from_path(package_path)
-            package.write_metadata(page_pixel_sizes={1: (10, 10)})
-            chapter = Chapter(None, -1, [ParagraphLayout("text", 0, [
-                BlockLayout(1, 1, (1, 1, 2, 2), ["original"])
+            package_path = root / "fixture-extraction"
+            package = make_extraction(
+                package_path, page_pixel_sizes={1: (10, 10)}, with_toc=True
+            )
+            chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+                SourceTextFragment(1, 1, (1, 1, 2, 2), ["original"])
             ])])
-            save_xml(encode_chapter(chapter), package_path / "chapters" / "chapter_1.xml")
+            save_xml(encode_chapter(chapter), package_path / "chapters" / "chapter_head.xml")
 
             run = SmokeRun(
-                "double_column.pdf", "markdown",
+                "pdf/double_column.pdf", "markdown",
                 translation={"package_marker": "[translated]", "package_submit": "APPEND_BLOCK"},
             )
-            asset = SmokeAsset("double_column.pdf", "pdf", Path("source.pdf"))
-            from pdf_craft.craft import PDFCraft
+            asset = SmokeAsset("pdf/double_column.pdf", "pdf", Path("source.pdf"))
+            from pdf_craft import PDFCraft
             craft = PDFCraft()
             with patch("pdf_craft_tool.smoke.runner.PDFCraft", return_value=craft), \
                     patch.object(craft, "extract_pdf_with_metering", return_value=(
@@ -333,7 +382,60 @@ class TestSmokeMatrix(unittest.TestCase):
             rendered = (root / "output" / "book.md").read_text()
             self.assertIn("original", rendered)
             self.assertIn("original[translated]", rendered)
+            self.assertEqual(rendered.count("original"), 2)
             self.assertEqual(details["outputs"], [str(root / "output" / "book.md")])
+            with zipfile.ZipFile(root / "translated.pcex") as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+                index = json.loads(archive.read("translations/index.json"))
+            self.assertEqual(manifest["format_version"], 4)
+            self.assertEqual(len(index["translations"]), 1)
+            translated = craft.open_extraction(root / "translated.pcex")
+            translations = craft.list_translations(translated)
+            self.assertEqual(len(translations), 1)
+            self.assertEqual(translations[0].target_language, "en")
+            self.assertEqual(craft.resolve_translation(translated).id, translations[0].id)
+
+    def test_epub_route_renders_an_explicit_pcex_translation_layer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "output").mkdir()
+            package_path = root / "fixture-extraction"
+            package = make_extraction(
+                package_path, page_pixel_sizes={1: (10, 10)}, with_toc=True
+            )
+            chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+                SourceTextFragment(1, 1, (1, 1, 2, 2), ["original"])
+            ])])
+            save_xml(encode_chapter(chapter), package_path / "chapters" / "chapter_head.xml")
+
+            run = SmokeRun(
+                "pdf/double_column.pdf", "package-epub",
+                translation={
+                    "package_marker": "[translated]",
+                    "render_mode": "REPLACE",
+                    "translation_id": "smoke-en",
+                    "target_language": "en",
+                },
+            )
+            asset = SmokeAsset("pdf/double_column.pdf", "pdf", Path("source.pdf"))
+            from pdf_craft import PDFCraft
+            craft = PDFCraft()
+            with patch("pdf_craft_tool.smoke.runner.PDFCraft", return_value=craft), \
+                    patch.object(craft, "extract_pdf_with_metering", return_value=(
+                        package, OCRTokensMetering(0, 0)
+                    )):
+                status, errors, details = _run_pdf(
+                    run, asset, root, cast(OCRConfig, None),
+                )
+
+            self.assertEqual(status, "passed", errors)
+            self.assertEqual(details["outputs"], [str(root / "output" / "book.epub")])
+            translated = craft.open_extraction(root / "translated.pcex")
+            self.assertEqual(
+                [item.id for item in craft.list_translations(translated)],
+                ["smoke-en"],
+            )
+            self.assertEqual(craft.resolve_translation(translated, "smoke-en").id, "smoke-en")
 
 
 def _write_epub(path: Path, files: dict[str, str]) -> Path:
@@ -353,21 +455,18 @@ def _opf(manifest: str, spine: str, spine_attrs: str) -> str:
     return f'<package version="2.0"><manifest>{manifest}</manifest><spine {spine_attrs}>{spine}</spine></package>'
 
 
-def _package_with_image(root: Path) -> DocumentPackage:
+def _package_with_image(root: Path) -> ExtractionPaths:
     package = _package_without_assets(root)
-    (package.assets_path / "image.png").write_bytes(b"image")
-    cover = root / "cover.png"
-    cover.write_bytes(b"cover")
-    package = DocumentPackage(package.chapters_path, package.assets_path, None, cover, package.metadata_path)
-    chapter = Chapter(None, -1, [AssetLayout(1, "image", (0, 0, 1, 1), [], [], [], "image")])
-    save_xml(encode(chapter), package.chapters_path / "chapter_head.xml")
+    (package.assets / "image.png").write_bytes(b"image")
+    package.cover.write_bytes(b"cover")
+    chapter = Chapter(None, -1, [StandaloneAsset(SourceAsset(1, "image", (0, 0, 1, 1), [], [], [], "image"))])
+    save_xml(encode(chapter), package.chapters / "chapter_head.xml")
     return package
 
 
-def _package_without_assets(root: Path) -> DocumentPackage:
-    package = DocumentPackage.from_path(root)
-    package.chapters_path.mkdir(parents=True)
-    package.assets_path.mkdir()
-    chapter = Chapter(None, -1, [ParagraphLayout("text", 0, [BlockLayout(1, 1, (0, 0, 1, 1), ["content"])])])
-    save_xml(encode(chapter), package.chapters_path / "chapter_head.xml")
+def _package_without_assets(root: Path) -> ExtractionPaths:
+    make_extraction(root)
+    package = ExtractionPaths.at(root)
+    chapter = Chapter(None, -1, [TextFlowItem("body", 0, [SourceTextFragment(1, 1, (0, 0, 1, 1), ["content"])])])
+    save_xml(encode(chapter), package.chapters / "chapter_head.xml")
     return package

@@ -7,7 +7,7 @@ from ...expression import ExpressionKind, ParsedItem, parse_latex_expressions
 from ...language import is_latin_letter
 from ...markdown.paragraph import parse_raw_markdown
 from ...pdf import TITLE_TAGS, PageLayout
-from .chapter import AssetLayout, BlockLayout, InlineExpression, ParagraphLayout
+from .chapter import SourceAsset, SourceTextFragment, TextSource, InlineExpression, TextFlowItem
 from .content import Content, expand_text_in_content, first, last
 from .mergeable import LINK_FLAGS, check_mergeable
 from .reading_serials import split_reading_serials
@@ -36,8 +36,8 @@ _LATEX_PLACEHOLDER_MARKER = "\uE000PDF_CRAFT_LATEX"
 
 @dataclass
 class _LastTail:
-    page_para: ParagraphLayout
-    override: list[AssetLayout]
+    page_para: TextFlowItem
+    override: list[SourceAsset]
 
 
 @dataclass
@@ -54,17 +54,54 @@ class _AssetHolder:
 @dataclass
 class _PendingParagraph:
     source: PageLayout
-    paragraph: ParagraphLayout
+    paragraph: TextFlowItem
+
+
+@dataclass(frozen=True)
+class JoinedPageProgress:
+    """Processed pages may still own a tail after ``closed_through``.
+
+    No later joined item can originate on or before the closed watermark.
+    """
+
+    closed_through: int
+    processed_through: int
 
 
 class Jointer:
-    def __init__(self, layouts: Iterable[tuple[int, list[PageLayout]]]) -> None:
+    def __init__(self, layouts: Iterable[tuple[int, list[PageLayout]]],
+                 sources: dict[tuple[int, int], tuple[int, TextSource]] | None = None) -> None:
         self._layouts = layouts
+        self._sources = sources if sources is not None else {}
+        self._reading_positions: dict[tuple[int, tuple[int, int, int, int]], int] = {}
 
-    def execute(self) -> Generator[ParagraphLayout | AssetLayout, None, None]:
+    def execute(self) -> Generator[TextFlowItem | SourceAsset, None, None]:
+        for item in self.execute_with_progress():
+            if not isinstance(item, JoinedPageProgress):
+                yield item
+
+    def execute_with_progress(self) -> Generator[TextFlowItem | SourceAsset | JoinedPageProgress, None, None]:
         last_tail: _LastTail | None = None
+        last_page_index: int | None = None
+        closed_through = -1
 
-        for page_index, raw_layouts in self._iter_layout_serials():
+        for page_index, raw_layouts in self._iter_layout_serials(with_progress=True):
+            last_page_index = page_index
+            if raw_layouts is None:
+                safe_page = page_index
+                if last_tail is not None:
+                    safe_page = last_tail.page_para.children[0].page_index - 1
+                closed_through = max(closed_through, safe_page)
+                yield JoinedPageProgress(closed_through, page_index)
+                continue
+            if not raw_layouts:
+                if last_tail:
+                    _normalize_paragraph_content(last_tail.page_para)
+                    yield last_tail.page_para
+                    yield from last_tail.override
+                    last_tail = None
+                continue
+
             # 此处为完成如下业务要求：
             # 1. 当阅读序列跨越 group（跨页、跨分栏、跨因图片而挤变形拆分的段落）时，必须对连接处验证。若它们是被拆分的自然段，则拼起来。
             # 2. 因为插图、表格而拆分的自然段，需将插图存起来接到完整的自然段最后，而不是任其分割自然段。
@@ -80,11 +117,25 @@ class Jointer:
                     yield from tail
                 continue
 
-            first_layout = cast(ParagraphLayout, body[0])
+            first_layout = cast(TextFlowItem, body[0])
+            # Assets retain their position between source text fragments.
+            # Only display formulas block an author paragraph; images/tables
+            # become children when the text on both sides is continuous.
+            if last_tail and any(asset.ref == "formula" for asset in [*last_tail.override, *head]):
+                _normalize_paragraph_content(last_tail.page_para)
+                yield last_tail.page_para
+                yield from last_tail.override
+                last_tail = None
             if last_tail and self._can_merge_paragraphs(
                 last_tail.page_para, first_layout
             ):
-                last_tail.page_para.blocks.extend(first_layout.blocks)
+                # ``blocks`` is a compatibility projection.  Extend the real
+                # ordered v3 children so cross-page source fragments survive.
+                last_tail.page_para.children.extend(last_tail.override)
+                last_tail.page_para.children.extend(head)
+                last_tail.page_para.children.extend(first_layout.children)
+                last_tail.override = []
+                head = []
                 del body[0]
 
             if not body:
@@ -108,7 +159,7 @@ class Jointer:
                 yield body[i]
 
             last_tail = _LastTail(
-                page_para=cast(ParagraphLayout, body[-1]),
+                page_para=cast(TextFlowItem, body[-1]),
                 override=list(tail),
             )
 
@@ -116,20 +167,33 @@ class Jointer:
             _normalize_paragraph_content(last_tail.page_para)
             yield last_tail.page_para
             yield from last_tail.override
+        if last_page_index is not None and last_page_index > closed_through:
+            yield JoinedPageProgress(last_page_index, last_page_index)
 
     def _iter_layout_serials(
-        self,
-    ) -> Generator[tuple[int, list[PageLayout]], None, None]:
+        self, *, with_progress: bool = False,
+    ) -> Generator[tuple[int, list[PageLayout] | None], None, None]:
         for page_index, raw_layouts in self._layouts:
+            self._reading_positions.clear()
+            for layout in raw_layouts:
+                record = self._sources.get((page_index, id(layout)))
+                if record is not None:
+                    self._reading_positions[(page_index, layout.det)] = record[1].reading_order
+            found_serial = False
             for layouts in split_reading_serials(raw_layouts):
+                found_serial = True
                 yield page_index, layouts
+            if not found_serial:
+                yield page_index, []
+            if with_progress:
+                yield page_index, None
 
-    def _split_layouts(self, layouts: list[ParagraphLayout | AssetLayout]):
-        head: list[AssetLayout] = []
-        tail: list[AssetLayout] = []
+    def _split_layouts(self, layouts: list[TextFlowItem | SourceAsset]):
+        head: list[SourceAsset] = []
+        tail: list[SourceAsset] = []
 
         for layout in layouts:
-            if isinstance(layout, ParagraphLayout):
+            if isinstance(layout, TextFlowItem):
                 break
             head.append(layout)
 
@@ -137,7 +201,7 @@ class Jointer:
             if i < len(head):
                 break
             layout = layouts[i]
-            if isinstance(layout, ParagraphLayout):
+            if isinstance(layout, TextFlowItem):
                 break
             tail.append(layout)
 
@@ -148,7 +212,7 @@ class Jointer:
 
     def _join_and_handle_asset_layouts(
         self, page_index, layouts: list[PageLayout]
-    ) -> Generator[ParagraphLayout | AssetLayout, None, None]:
+    ) -> Generator[TextFlowItem | SourceAsset, None, None]:
         # layout 可能被后续处理，必须等待所有 layout 处理完毕
         for layout in list(
             self._join_asset_layouts(
@@ -165,14 +229,15 @@ class Jointer:
             if layout.ref == "table":
                 _normalize_table(layout)
 
-            yield AssetLayout(
+            yield SourceAsset(
                 page_index=page_index,
-                ref=layout.ref,
-                det=layout.det,
+                ref="formula" if layout.ref == "equation" else layout.ref,
+                bbox=layout.det,
                 title=_parse_block_content(layout.title),
                 content=_parse_block_content(layout.content),
                 caption=_parse_block_content(layout.caption),
-                hash=layout.hash,
+                asset_hash=layout.hash,
+                reading_order=self._reading_positions.get((page_index, layout.det)),
             )
 
     def _join_asset_layouts(self, page_index, layouts: list[PageLayout]):
@@ -244,15 +309,16 @@ class Jointer:
                     # 将 Markdown 标题前的 `##` 之类的符号删除，DeepSeek OCR 总会生成这种符号
                     layout.text = _MARKDOWN_HEAD_PATTERN.sub("", layout.text)
 
-                paragraph = ParagraphLayout(
-                    ref=layout.ref,
+                paragraph = TextFlowItem(
+                    role="heading" if layout.ref in TITLE_TAGS else "body",
                     level=-1,
-                    blocks=[
-                        BlockLayout(
+                    children=[
+                        SourceTextFragment(
                             page_index=page_index,
-                            order=layout.order,
-                            det=layout.det,
+                            source_order=self._sources.get((page_index, id(layout)), (layout.order, None))[0],
+                            bbox=layout.det,
                             content=_parse_block_content(layout.text),
+                            source=self._sources.get((page_index, id(layout)), (0, None))[1],
                         )
                     ],
                 )
@@ -270,15 +336,17 @@ class Jointer:
             yield pending
 
     def _can_merge_paragraphs(
-        self, para1: ParagraphLayout, para2: ParagraphLayout
+        self, para1: TextFlowItem, para2: TextFlowItem
     ) -> bool:
-        if para1.ref != "text":
+        if para1.role != "body":
             return False
-        if para1.ref != para2.ref:
+        if para1.role != para2.role:
             return False
 
-        block1 = para1.blocks[-1]
-        block2 = para2.blocks[0]
+        block1 = para1.children[-1]
+        block2 = para2.children[0]
+        if not isinstance(block1, SourceTextFragment) or not isinstance(block2, SourceTextFragment):
+            return False
 
         return check_mergeable(block1.content, block2.content)
 
@@ -457,13 +525,18 @@ def _height(det) -> int:
 
 
 # 将单词的连接符 `-` 删去，并将后半节单词移到前面一段拼接
-def _normalize_paragraph_content(paragraph: ParagraphLayout):
-    if len(paragraph.blocks) < 2:
+def _normalize_paragraph_content(paragraph: TextFlowItem, *, preserve_fragments: bool = False):
+    # Defer normalization until after editable source ownership is compiled.
+    # Legacy joiner callers without source records retain their old behavior.
+    if not preserve_fragments and any(
+        isinstance(child, SourceTextFragment) and child.source is not None for child in paragraph.children
+    ):
+        return
+    if len(paragraph.children) < 2:
         return
 
-    for i in range(1, len(paragraph.blocks)):
-        block1 = paragraph.blocks[i - 1]
-        block2 = paragraph.blocks[i]
+    fragments = [child for child in paragraph.children if isinstance(child, SourceTextFragment)]
+    for block1, block2 in zip(fragments, fragments[1:]):
 
         text1 = last(block1.content)
         text2 = first(block2.content)
@@ -488,7 +561,22 @@ def _normalize_paragraph_content(paragraph: ParagraphLayout):
             del block2.content[0]
 
     # 极端情况下 block2 会因为单词被移走而被清空。此时要将其整个删去。
-    paragraph.blocks = [block for block in paragraph.blocks if block.content]
+    if not preserve_fragments:
+        paragraph.children = [
+            child for child in paragraph.children
+            if not isinstance(child, SourceTextFragment) or child.content
+        ]
+
+
+def normalize_source_projection(paragraph: TextFlowItem) -> None:
+    """Dehyphenate assembled semantic text without erasing source identities.
+
+    Content is already a detached projection here; TextSource keeps the exact
+    OCR text. An empty projected fragment still owns its original PDF region.
+    """
+    if any(isinstance(child, SourceTextFragment) and child.source is not None
+           for child in paragraph.children):
+        _normalize_paragraph_content(paragraph, preserve_fragments=True)
 
 
 def _parse_block_content(text: str | None) -> Content:

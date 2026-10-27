@@ -1,5 +1,8 @@
+# pylint: disable=protected-access
+
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, Generic, Iterable, TypeVar, cast
 
@@ -7,14 +10,15 @@ from json_repair import repair_json
 from pydantic import BaseModel, StrictInt, ValidationError, field_validator, model_validator
 
 from ...common import XMLReader, split_by_cv
+from ...concurrency import ConcurrentExecutor, FixedCapacity
 from .config import MAX_LEVELS, MAX_TITLE_CV
+from ...runtime import IO_DOMAIN
 from ...llm import LLM, Message, MessageRole, runtime_for
 from ...llm.guaranteed import GuaranteedOptions, request_guaranteed_json
 from ...pdf import TITLE_TAGS, Page
 from .toc_levels import Ref2Level
 from .toc_pages import PageRef
 
-_MAX_RETRIES = 3
 _P = TypeVar("_P")
 _R = TypeVar("_R")
 
@@ -24,20 +28,8 @@ class LLMAnalysisError(Exception):
         super().__init__(message)
 
 
-def analyse_title_levels_by_llm(llm: LLM, pages: XMLReader[Page]) -> Ref2Level:
-    titles: list[_Title] = []
-    for page in pages.read():
-        for layout in page.body_layouts:
-            if layout.ref not in TITLE_TAGS:
-                continue
-            _, top, _, bottom = layout.det
-            titles.append(
-                _Title(
-                    text=re.sub(r"\s+", " ", layout.text).strip(),
-                    ref=(page.index, layout.order),
-                    height=bottom - top,
-                )
-            )
+async def analyse_title_levels_by_llm(llm: LLM, pages: XMLReader[Page]) -> Ref2Level:
+    titles = await IO_DOMAIN.run(_read_titles, pages)
 
     if not titles:
         return {}
@@ -56,7 +48,7 @@ def analyse_title_levels_by_llm(llm: LLM, pages: XMLReader[Page]) -> Ref2Level:
         llm=llm,
         validate=_validate_title_response,
     )
-    levels = analyser.request(
+    levels = await analyser.request(
         payload=len(titles),
         messages=(
             Message(
@@ -82,7 +74,25 @@ def analyse_title_levels_by_llm(llm: LLM, pages: XMLReader[Page]) -> Ref2Level:
     return ref2level
 
 
-def analyse_toc_levels_by_llm(
+def _read_titles(pages: XMLReader[Page]) -> list["_Title"]:
+    titles: list[_Title] = []
+    for page in pages.read():
+        for layout in page.body_layouts:
+            if layout.ref not in TITLE_TAGS:
+                continue
+            _, top, _, bottom = layout.det
+            titles.append(
+                _Title(
+                    text=re.sub(r"\s+", " ", layout.text).strip(),
+                    ref=(page.index, layout.order),
+                    height=bottom - top,
+                )
+            )
+
+    return titles
+
+
+async def analyse_toc_levels_by_llm(
     llm: LLM,
     toc_page_refs: list[PageRef],
     toc_page_contents: list[Page],
@@ -105,7 +115,7 @@ def analyse_toc_levels_by_llm(
         llm=llm,
         validate=_validate_toc_response,
     )
-    levels = analyser.request(
+    levels = await analyser.request(
         payload=len(matched_title2references),
         messages=(
             Message(
@@ -565,9 +575,13 @@ class _LLMAnalyser(Generic[_P, _R]):
     ) -> None:
         self._llm = llm
         self._validate: Callable[[str, _P], tuple[_R | None, str | None]] = validate
-        self._runtime = runtime_for(llm, protocol_version="toc-json-v1") if isinstance(llm, LLM) else None
+        self._runtime = runtime_for(
+            llm,
+            ConcurrentExecutor(FixedCapacity(1)),
+            protocol_version="toc-json-v1",
+        ) if isinstance(llm, LLM) else None
 
-    def request(self, payload: _P, messages: Iterable[Message]) -> _R:
+    async def request(self, payload: _P, messages: Iterable[Message]) -> _R:
         class _ResponseSchema(BaseModel):
             """Transport schema; TOC validator owns RESULT and ID semantics."""
             payload: dict[str, Any]
@@ -587,17 +601,23 @@ class _LLMAnalyser(Generic[_P, _R]):
 
         # The business validators already extract RESULT and enforce their own
         # schema. The guaranteed layer supplies typed retries and bounded history.
+        deadline = (
+            time.monotonic() + self._llm.total_timeout
+            if self._runtime is not None and self._llm.total_timeout is not None else None
+        )
         try:
-            return request_guaranteed_json(GuaranteedOptions(
+            return await request_guaranteed_json(GuaranteedOptions(
                 messages=list(messages),
                 request=lambda current, index, maximum: (
-                    self._runtime.request(current, retry_index=index, retry_max=maximum, use_cache=False)
+                    self._runtime.request(
+                        current, retry_index=index, retry_max=maximum, use_cache=False,
+                        deadline=deadline,
+                    )
                     if self._runtime is not None
                     else cast(Any, self._llm).request(input=current)
                 ),
                 schema=_ResponseSchema,
                 parse=parse,
-                max_retries=_MAX_RETRIES - 1,
                 extractor=_extract_result_json,
             ))
         except Exception as error:

@@ -23,9 +23,19 @@ The extra supplies the Python runtime for local models. It does not choose a PyT
 ## Requirements
 
 - Python `>=3.11,<3.14`
-- Poppler for PDF conversion and the standard PDF translation/patch workflow
+- Poppler for PDF conversion, OCR extraction, and PDF patching. Patching renders
+  source pages only to sample local erasure colors; it does not rasterize them into
+  the output.
+- Ghostscript for PDF patching. It compiles the source page into a visual-only
+  layer, so the original text cannot be selected beneath translated text.
 - Network and valid credentials for vendor OCR
 - A CUDA-capable NVIDIA GPU, matching PyTorch, model storage, and adequate VRAM for local OCR
+
+PySide6/Qt is installed as a Python dependency. PDF patching also needs suitable
+local fonts. Vector inline-formula rendering is optional: when enabled it needs
+Matplotlib plus a TeX installation whose `latex` command is available. Without either
+runtime, or when one formula cannot render, patching continues with readable plain
+text for that formula.
 
 Using a virtual environment is recommended:
 
@@ -39,17 +49,72 @@ python -m pip install pdf-craft
 
 ## Install Poppler
 
+The default PDF reader uses `pdfinfo` and `pdftoppm` with local and vendor OCR.
+Publication page labels use Poppler's GLib API; install `libpoppler-glib8` (or the
+distribution's ABI-equivalent package) on Linux. macOS Homebrew Poppler supplies
+it; Windows deployments must make the corresponding DLLs discoverable to Python.
+Custom handlers provide their own business reads/renders; no automatic full-input
+validation runs. See [optional input assertions](ERROR_HANDLING.md#optional-input-assertions).
+
+
 ```bash
 # macOS
 brew install poppler
 
 # Debian / Ubuntu
-sudo apt-get update && sudo apt-get install poppler-utils
+sudo apt-get update && sudo apt-get install poppler-utils libpoppler-glib8
 ```
 
-On Windows, install a Poppler binary distribution and add its `bin` directory to `PATH`. Alternatively, configure `DefaultPDFHandler(poppler_path="C:/tools/poppler/bin")` through `PDFOptions`.
+On Windows, install a Poppler binary distribution and add its `bin` directory to `PATH`. The built-in Poppler adapter is selected automatically; `PDFOptions.pdf_handler` is reserved for async custom handlers.
 
 Check the installation with `pdfinfo -v`.
+
+For direct native reads with a non-PATH installation, use
+`pdf_pages_count(path, pdf_handler=DefaultPDFHandler(poppler_path=directory))`
+(`DefaultPDFHandler` is imported from `pdf_craft.pdf`). The same directory is
+used for reading; invalid directories still fail.
+
+Keep the PDF backends current when upgrading an existing deployment. PDF Craft
+requires pypdf 6.21.2 or later within the 6.x series. Poppler is installed
+separately: updating the Python package does not update the system tools.
+
+```bash
+python -m pip install --upgrade pdf-craft
+# macOS
+brew update
+brew upgrade poppler
+# Debian / Ubuntu: update to the versions available in your distribution
+sudo apt-get update
+sudo apt-get install --only-upgrade poppler-utils libpoppler-glib8
+```
+
+Backend upgrades do not guarantee that a previously unsupported document becomes compatible.
+
+## Install Ghostscript for PDF patching
+
+PDF patching requires the Ghostscript command-line executable:
+
+```bash
+# macOS
+brew install ghostscript
+
+# Debian / Ubuntu
+sudo apt-get update && sudo apt-get install ghostscript
+```
+
+On Windows, install Ghostscript and add `gswin64c.exe` to `PATH`. Confirm that
+`gs --version` (or `gswin64c --version`) works in the same environment that
+runs Python.
+
+## Optional: vector inline formulas in patched PDFs
+
+`PatchTextOptions(render_inline_formulas=True)` is the default. When Matplotlib and
+TeX are available, inline LaTeX is written back as a vector PDF fragment; otherwise
+pdf-craft falls back to readable plain text rather than failing the PDF.
+
+Install Matplotlib in the environment running pdf-craft and install a TeX
+distribution that exposes `latex` on `PATH`. This is independent of OCR and is not
+required when plain-text formula fallback is acceptable.
 
 ## Local OCR setup
 
@@ -62,9 +127,9 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 Local OCR requires `True`. Models download on first use by default. To pre-download a model and later run without downloads:
 
 ```python
-from pdf_craft import DeepSeekOCRLocalConfig, PDFCraft, PDFOptions, predownload_models
+from pdf_craft import DeepSeekOCRLocalConfig, PDFCraft, PDFOptions
 
-predownload_models(ocr=DeepSeekOCRLocalConfig(models_cache_path="models"))
+PDFCraft().predownload_models(ocr=DeepSeekOCRLocalConfig(models_cache_path="models"))
 craft = PDFCraft(pdf=PDFOptions(ocr=DeepSeekOCRLocalConfig(
     models_cache_path="models", local_only=True,
 )))

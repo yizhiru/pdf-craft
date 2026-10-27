@@ -118,7 +118,7 @@ craft = PDFCraft(pdf=PDFOptions(ocr=DeepSeekOCRLocalConfig(
     models_cache_path="models-cache",
 )))
 options = ExtractionOptions(ocr_size="base")
-craft.extract_pdf("input.pdf", "package", options)
+craft.extract_pdf("input.pdf", "book.pcex", options)
 ```
 
 ### 预下载模型
@@ -126,9 +126,9 @@ craft.extract_pdf("input.pdf", "package", options)
 如果希望把模型下载和实际转换分开，可以使用 `predownload_models`：
 
 ```python
-from pdf_craft import DeepSeekOCRLocalConfig, predownload_models
+from pdf_craft import DeepSeekOCRLocalConfig, PDFCraft
 
-predownload_models(
+PDFCraft().predownload_models(
     ocr=DeepSeekOCRLocalConfig(models_cache_path="models-cache"),
     revision=None,
 )
@@ -190,16 +190,60 @@ Unlimited OCR vendor 配置使用百度服务凭据：
 | `base_url` | `str` | `https://aip.baidubce.com` | 百度服务基础 URL |
 | `poll_interval_seconds` | `float` | `2.0` | 轮询异步任务的间隔 |
 | `timeout_seconds` | `int` | `180` | OCR 任务超时时间 |
+| `retry_times` | `int` | `2` | 可重试网络错误的重试次数 |
+| `retry_interval_seconds` | `float` | `1.0` | 供应商未给出等待时间时的重试间隔 |
 
 ```python
-from pdf_craft import UnlimitedOCRVendorConfig, PDFCraft, PDFOptions
+from pdf_craft import (
+    ConcurrentExecutor, FixedCapacity, UnlimitedOCRVendorConfig,
+    PDFCraft, PDFOptions,
+)
 
 ocr = UnlimitedOCRVendorConfig(
     ak="your-access-key",
     sk="your-secret-key",
 )
-craft = PDFCraft(pdf=PDFOptions(ocr=ocr))
+craft = PDFCraft(pdf=PDFOptions(
+    ocr=ocr,
+    ocr_executor=ConcurrentExecutor(FixedCapacity(8)),
+))
 ```
+
+### 自定义图片 URL
+
+默认情况下，Vendor OCR 会读取每张渲染后的 PNG，并生成 Base64 Data URL。若供应商支持或
+要求远程图片 URL，可以通过 `OCRImageURLResolver` 自定义转换。resolver 接收渲染图片的
+`Path`，并返回 HTTP(S) URL 或 Base64 图片 Data URL：
+
+```python
+from pathlib import Path
+
+from pdf_craft import (
+    ConcurrentExecutor, DeepSeekOCRVendorConfig, FixedCapacity,
+    OCRImageURLResolver, PDFCraft, PDFOptions,
+)
+
+async def resolve_ocr_image(path: Path) -> str:
+    return await image_service.create_url(path)
+
+resolver: OCRImageURLResolver = resolve_ocr_image
+craft = PDFCraft(pdf=PDFOptions(
+    ocr=DeepSeekOCRVendorConfig(
+        base_url="https://example.com/v1",
+        api_key="your-api-key",
+        model="deepseek-ocr",
+    ),
+    ocr_executor=ConcurrentExecutor(FixedCapacity(8)),
+    ocr_image_url_resolver=resolver,
+))
+```
+
+resolver 必须是异步函数，并在调用方事件循环中执行。每张逻辑 OCR 图片只会在需要时转换一次，
+网络重试会复用同一个 URL。脚注处理产生的第二阶段图片属于另一张逻辑图片，会单独转换。
+
+DeepSeek OCR 把返回值直接写入 `image_url.url`。Unlimited OCR 会把 Base64 Data URL 写入
+`file_data`，把 HTTP(S) URL 写入 `file_url`。上传、签名、过期时间、清理、缓存与存储服务的
+并发策略由提供 resolver 的应用负责。
 
 ## `PDFOptions` 的配置边界
 
@@ -229,5 +273,26 @@ PDFCraft(pdf=PDFOptions(
 - local OCR 依赖本地 CUDA、GPU 显存和模型缓存；没有这些条件时选择 vendor OCR。
 - `local_only=True` 不会替你下载缺失模型；请先完成模型下载。
 - vendor OCR 依赖网络和有效凭据，`base_url`、模型名及凭据错误会在请求阶段失败。
+- vendor OCR 只把远程供应商请求交给 `ocr_executor` 并发；PDF 渲染与后续处理仍保持串行。
+- retry 会先释放 `ocr_executor` 容量，等待结束后每次 HTTP 尝试重新申请容量。Unlimited OCR
+  的 token 获取、任务提交、每次轮询和结果下载分别算一个远程 operation；轮询间隔不占槽，
+  查询或下载重试也不会重新提交页面任务。access token 失效时会刷新 token 后重试当前
+  operation；供应商明确报告任务处理失败时，才会重新提交当前页面。
+- HTTP 429 默认按限流重试；如果响应体明确表示余额或配额耗尽，则立即关闭共享执行器。
+  余额、配额、认证和权限错误不可忽略，其他页面错误仍可交给 `ErrorPolicy.ignore_ocr_errors`。抛出的
+  `OCRError` 保留供应商异常 cause 链；策略 callback 收到的是 FailureContext，包含定位、
+  错误摘要和可获得的状态码/request id，不直接暴露 HTTP response。Unlimited OCR
+  query 以 `task_error` 报告“额度不够”时同样属于不可忽略的配额终止错误。
+- 设置任一累计 OCR token 预算后，vendor 请求会逐页结算并将精确的剩余预算传给下一页。
 - `ocr_size` 由提取选项控制，不能用来改变 vendor/local backend；backend 由 OCR 配置对象决定。
 - 翻译所需的文本 LLM 与 OCR backend 是两套独立配置，本指南不讨论翻译配置。
+
+
+统一策略、默认严格失败和全局全部降级的规则见 [错误处理](ERROR_HANDLING.md)。
+
+暂时限流现在由 executor 的 `RateLimitScope` 统一处理，不消耗 vendor 的 `retry_times`，
+也不使用 `retry_interval_seconds`。后两者仍控制非限流恢复。参见
+[共享限流范围](API_REFERENCE.md#共享限流范围)。
+
+模型服务请求还支持操作级 `request_headers`；作用域和资源下载边界见
+[API 参考](API_REFERENCE.md#操作级请求-header)。

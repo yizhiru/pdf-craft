@@ -11,9 +11,18 @@ poetry run python -m pdf_craft_tool --help
 ```
 
 先复制 `.env.template` 为 `.env`，一次性填写全部六种 `PDF_CRAFT_*` OCR 配置；切换
-backend 时不需要再修改 `.env`。翻译
-翻译或可选的 TOC 层级增强需要文本 chat-completion LLM profile；OCR-only endpoint
+backend 时不需要再修改 `.env`。翻译或可选的 TOC 层级增强需要文本 chat-completion LLM profile；OCR-only endpoint
 不能代替它。默认 profile 使用本机 `oo llm config --json` 提供的 OOMOL 连接，凭据不写入 `.env`。
+JEV 页审核通过官方 TypeSafe SDK 直连，使用 `.env` 中独立的
+`PDF_CRAFT_JEV_API_KEY`、`PDF_CRAFT_JEV_BASE_URL` 和 `PDF_CRAFT_JEV_MODEL`；它不再通过 `oo` 转发。
+
+缓存 OCR 页可直接运行官方 JEV 审核：
+
+```shell
+poetry run python -m pdf_craft_tool analysis review-jev \
+  tests/assets/analysis/citation_large_ocr \
+  --output pdf-craft-output/official-jev-review
+```
 
 ## OCR backend 配置与选择
 
@@ -42,34 +51,34 @@ run 的 `backend` 字段中选择。local backend 使用自己的模型缓存、
 序号命名，例如 `citation-convert-20260822-001/`；同一次调用绝不会覆盖已有目录。
 `package render` 和 `epub translate` 也使用此规则。通过 `--work-dir` 指定位置时，
 目录不存在则创建，已存在则复用。PDF 命令会在工作目录内记录来源 PDF 和 OCR
-设置，防止不同输入或不同 OCR backend 错误复用已有 OCR 缓存。工作目录保存中间
-`package/`、翻译缓存和日志，方便人工检查、恢复或后续单独渲染。
+设置，防止不同输入或不同 OCR backend 错误复用已有 OCR 缓存。工作目录保存
+`analysis/`、`book.pcex`、翻译缓存和日志，方便人工检查、恢复或后续单独渲染。
 
 所有 `--pages` 参数使用从 1 开始的 PDF 页码，例如 `--pages 1,2,3`。
 
-## PDF 与 Package
+## PDF 与 PDFCraftExtraction
 
 ```shell
-# PDF -> 可复用 DocumentPackage
-poetry run python -m pdf_craft_tool pdf extract tests/assets/citation.pdf \
+# PDF -> 可复用 .pcex
+poetry run python -m pdf_craft_tool pdf extract tests/assets/pdf/citation.pdf \
   --ocr-mode deepseek-ocr-vendor --pages 1 --work-dir pdf-craft-output/citation-extract
 
-# DocumentPackage -> 翻译后的 DocumentPackage
+# .pcex -> 翻译后的 .pcex
 poetry run python -m pdf_craft_tool package translate \
-  pdf-craft-output/citation-extract/package zh \
-  --output-package pdf-craft-output/citation-zh-package
+  pdf-craft-output/citation-extract/book.pcex zh \
+  --output-package pdf-craft-output/citation-zh.pcex
 
-# Package -> Markdown 或 EPUB；此命令不需要 OCR 配置
-poetry run python -m pdf_craft_tool package render pdf-craft-output/citation-extract/package \
+# .pcex -> Markdown 或 EPUB；此命令不需要 OCR 配置
+poetry run python -m pdf_craft_tool package render pdf-craft-output/citation-extract/book.pcex \
   --format markdown --work-dir pdf-craft-output/citation-render
 
-# 原始 PDF + translated DocumentPackage -> patched PDF；此命令不需要 OCR/LLM
+# 原始 PDF + translated .pcex -> patched PDF；此命令不需要 OCR/LLM
 poetry run python -m pdf_craft_tool package patch-pdf \
-  tests/assets/citation.pdf pdf-craft-output/citation-zh-package \
+  tests/assets/pdf/citation.pdf pdf-craft-output/citation-zh.pcex \
   --output pdf-craft-output/citation-zh.pdf
 
 # PDF -> Markdown 或 EPUB
-poetry run python -m pdf_craft_tool pdf convert tests/assets/citation.pdf \
+poetry run python -m pdf_craft_tool pdf convert tests/assets/pdf/citation.pdf \
   --ocr-mode deepseek-ocr-vendor --format epub --pages 1,2,3
 ```
 
@@ -84,23 +93,23 @@ PDF 提取参数可在以上三个 PDF 命令中组合使用：
 `--ocr-mode` 覆盖 `.env` 内的 `PDF_CRAFT_OCR_MODE`；不传时使用 `.env` 的默认值。
 它只决定本次运行使用哪个已配置 backend，不会改写 `.env`。
 
-`package translate` 只读取已有 DocumentPackage，不会重新运行 OCR；
-`package patch-pdf` 只把已有 package 的文字按页面几何信息写回指定原始 PDF，
+`package translate` 只读取已有 `.pcex`，不会重新运行 OCR；
+`package patch-pdf` 只把已有 extraction 的文字按页面几何信息写回指定原始 PDF，
 不会调用 OCR 或 LLM。
 
 ## 翻译
 
 ```shell
 # PDF -> 已替换的译文 EPUB
-poetry run python -m pdf_craft_tool pdf translate tests/assets/citation.pdf zh \
+poetry run python -m pdf_craft_tool pdf translate tests/assets/pdf/citation.pdf zh \
   --format epub --submit replace --ocr-mode deepseek-ocr-vendor --pages 1
 
 # PDF -> 原文块后追加译文块的 Markdown
-poetry run python -m pdf_craft_tool pdf translate tests/assets/citation.pdf zh \
+poetry run python -m pdf_craft_tool pdf translate tests/assets/pdf/citation.pdf zh \
   --format markdown --submit append-block --ocr-mode deepseek-ocr-vendor --pages 1
 
 # PDF -> 替换式 PDF patch；PDF 不支持 append-block
-poetry run python -m pdf_craft_tool pdf translate tests/assets/citation.pdf zh \
+poetry run python -m pdf_craft_tool pdf translate tests/assets/pdf/citation.pdf zh \
   --format pdf --submit replace --ocr-mode deepseek-ocr-vendor --pages 1
 
 # EPUB -> EPUB，支持 replace 与 append-block
@@ -113,6 +122,60 @@ poetry run python -m pdf_craft_tool epub translate tests/assets/epub/Cambridge.e
 两者相同（默认都是 `translation`）时复用同一个 `LLM` 对象。`pdf translate --format pdf`
 只允许 `--submit replace`。PDF 提取命令还可通过 `--toc-llm PROFILE` 使用 LLM 改善目录层级判断。
 
+## 实验性 PageAnalysis 审查
+
+`analysis review-jev` 从已有 OCR 缓存重新执行传统 paragraph/citation resolution，投影为
+PageAnalysis，并通过官方 TypeSafe SDK 调用 JEV。它只输出页级风险，不调用 LLM，也不修改
+PageAnalysis 或章节文件：
+
+```shell
+poetry run python -m pdf_craft_tool analysis review-jev \
+  pdf-craft-output/analysis-baselines/citation-large-v1-unlimited/analysis/ocr \
+  --output pdf-craft-output/analysis-baselines/citation-large-jev-current
+```
+
+输出目录中的 `report.json` 使用 `risk = 1 - pass_probability`，默认在 `risk >= 0.70`
+时把页面列入 `review_page_indexes`；`raw/` 保留逐页 JEV 请求和响应，便于继续调 prompt。
+该命令与发布包使用同一个异步 JEV 客户端，但只用于仓库内的分析与调试。
+
+`analysis repair-jev-llm` 使用同一 JEV 门槛筛选页面，再以三页纯文本上下文调用指定 LLM profile；
+目标页不披露自己的 JEV 分数，前后页只披露 `jev_p_pass` 作为弱可靠性提示。LLM 每次返回完整
+目标页 JSON，并由 schema 与业务完整性修复循环校验。运行记录分别保存在 `jev-raw/`、
+`llm-raw/` 和 `llm-logs/`：
+
+```shell
+PDF_CRAFT_LLM_DEFAULT_PROVIDER=oomol \
+poetry run python -m pdf_craft_tool analysis repair-jev-llm \
+  tests/assets/analysis/citation_large_ocr \
+  --output pdf-craft-output/analysis-baselines/citation-large-llm-current \
+  --llm-profile default \
+  --jev-baseline tests/assets/analysis/citation_large_jev_baseline.json \
+  --jev-run strict-rubric
+```
+
+传入 `--jev-baseline` 时只重放已提交的 JEV 概率，不会调用 JEV 网络服务；
+这适合固定路由结果后反复调整 LLM prompt。这仍是实验性私有 CLI 通路，
+正式转换不会默认调用 JEV 或 LLM。
+`--all-pages` 会完全跳过 JEV，不披露任何 JEV 分数，并将每一页都交给 LLM；
+它主要用于检查 LLM 面对误选正常页时的抗干扰能力。
+`--llm-pages 2,4,25` 使用同样的无 JEV 条件，只处理指定页，便于反复调试 prompt。
+
+## 页级修复 smoke
+
+`tests/smoke/citation_large_page_repair.json` 固化了 citation_large 的页级修复通路：直接读取
+已提交的 `analysis/citation_large_ocr/page_*.xml`，重放固定 JEV baseline，只将低置信页交给
+LLM，并用 `citation_large_page_repair_expected.json` 严格校验最终语义变更。它不会重新运行 OCR，
+也不会在线调用 JEV：
+
+```shell
+MPLCONFIGDIR=/tmp/pdf-craft-mpl PDF_CRAFT_LLM_DEFAULT_PROVIDER=oomol \
+poetry run python -m pdf_craft_tool smoke matrix \
+  --config tests/smoke/citation_large_page_repair.json
+```
+
+smoke 的 `checks.json` 只接受最终结果完全匹配；Loop 中间重试不会导致失败，但会记录在
+`manifest.json` 的 `page_repair.attempts` 中。
+
 ## 冒烟矩阵
 
 先查看全部真实样本：
@@ -124,7 +187,7 @@ poetry run python -m pdf_craft_tool smoke assets
 `smoke run` 将一条参数化通路写入 Git 忽略的 `pdf-craft-output/smoke/` 下独立目录。
 目录同样以来源、route、日期和当日序号命名。通过 `--output-root DIR` 可替换这个根目录。
 目录包含
-`manifest.json`、`checks.json`、`logs/`、提取的 `package/` 和渲染产物；凭据会
+`manifest.json`、`checks.json`、`logs/`、提取的 `book.pcex`、`analysis/` 和渲染产物；凭据会
 从报告和 traceback 中脱敏。
 
 smoke 命令的进程退出码与报告状态一致：`passed` 和 `planned` 返回 0，`failed`
@@ -134,13 +197,13 @@ smoke 命令的进程退出码与报告状态一致：`passed` 和 `planned` 返
 ```shell
 # 先确认参数展开和产物目录，不调用 OCR
 poetry run python -m pdf_craft_tool smoke run \
-  --asset citation.pdf --route markdown --ocr-mode deepseek-ocr-vendor \
+  --asset pdf/citation.pdf --route markdown --ocr-mode deepseek-ocr-vendor \
   --pages 1 --ocr-size tiny --marker '[translated]' --dry-run
 
 # 运行真实 PDF -> Markdown 路径，并执行 Package / Markdown 检查
 poetry run python -m pdf_craft_tool smoke run \
-  --asset citation.pdf --route markdown --ocr-mode deepseek-ocr-vendor \
-  --pages 1 --ocr-size tiny --marker '[translated]'
+  --asset pdf/citation.pdf --route markdown --ocr-mode deepseek-ocr-vendor \
+  --pages 1,2,3 --ocr-size tiny --ocr-concurrency 3 --marker '[translated]'
 
 # 运行 EPUB 格式检查，不需要 OCR 或 .env
 poetry run python -m pdf_craft_tool smoke run \
@@ -149,18 +212,21 @@ poetry run python -m pdf_craft_tool smoke run \
 # 运行真实 EPUB 翻译路径，并检查生成的 EPUB
 poetry run python -m pdf_craft_tool smoke run \
   --asset epub/Cambridge.epub --route epub-translate \
-  --target-language zh --submit append-block
+  --target-language zh --submit append-block --concurrency 3
 ```
 
 `--route` 可选 `package`、`markdown`、`epub`、`pdf-patch`、`epub-check`、
-`epub-translate`，以及专门验证 Package renderer 分支的
+`epub-translate`、`page-repair`，以及专门验证 Package renderer 分支的
 `package-markdown`、`package-epub`。PDF route 可使用同一组限制参数：
 `--pages`、`--ocr-size`、
 `--dpi`、token 限额、图片限额、`--cover`、`--footnotes`、`--plot` 和
-`--toc-assumed`。`markdown` 和 `epub` 使用 `--marker` / `--submit` 覆盖确定性的
+`--toc-assumed`；`--ocr-concurrency` 控制 vendor OCR 的共享并发容量。
+`markdown` 和 `epub` 使用 `--marker` / `--submit` 覆盖确定性的
 Package 变换；`pdf-patch` 使用 `--patch-prefix` 检验 patch 产物和 geometry。
 需要真实 LLM 翻译时，可以给 `smoke run` 传入 `--translation-llm-profile`
-和 `--fill-llm-profile`；`epub-translate` 默认使用 `translation` profile。
+和 `--fill-llm-profile`；`epub-translate` 默认使用 `translation` profile，
+`--concurrency` 同时设置 XML 翻译 window 和 LLM executor 容量。对于
+`page-repair`，`--concurrency` 设置页修复 LLM executor 容量。
 
 对于需要稳定保存或批量执行的组合，使用 JSON 矩阵：
 
@@ -181,7 +247,9 @@ poetry run python -m pdf_craft_tool smoke matrix \
 
 该矩阵读取当前工作区 `.env`，会产生真实 OCR 和文本 LLM 请求；执行前应确认
 `PDF_CRAFT_OCR_MODE`、对应 vendor OCR 配置以及 `translation`/`fill` LLM profile
-均已配置。local OCR route 在无 CUDA 环境中会记录为 skipped，不应伪装为 passed。
+均已配置。它覆盖三页 vendor OCR、英文 PDF 的 PCEX 翻译、单文档 EPUB 翻译和
+多章节英文 EPUB 翻译，并统一使用大于 1 的并发容量。local OCR route 在无 CUDA
+环境中会记录为 skipped，不应伪装为 passed。
 
 全部六种 OCR backend 的最小矩阵位于 `tests/smoke/all_ocr_backends.json`：
 

@@ -4,15 +4,21 @@ from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
 import tempfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from pdf_craft import OCRTokensMetering
 from pdf_craft_tool.cli import (
+    _ExtractionResult,
     _page_indexes,
     _parser,
     _record_pdf_cache_owner,
+    _render_package,
     _resolve_ocr_size,
     _run_matrix,
     _smoke_exit_code,
+    _patch_package_pdf,
+    _translate_package,
+    _translate_pdf,
     _validate_ocr_size,
     _work_dir,
 )
@@ -21,6 +27,109 @@ from pdf_craft_tool.runtime import create_llm_from_env, create_ocr_config_from_e
 
 
 class TestPDFCraftTool(unittest.TestCase):
+    def test_pdf_parser_exposes_opt_in_book_metadata_llm(self):
+        args = _parser().parse_args([
+            "pdf", "convert", "source.pdf", "--format", "epub",
+            "--book-metadata", "--metadata-llm", "metadata",
+        ])
+        self.assertTrue(args.book_metadata)
+        self.assertEqual(args.metadata_llm, "metadata")
+
+    def test_furniture_is_only_an_opt_in_pdf_translation_flag(self):
+        translated = _parser().parse_args([
+            "pdf", "translate", "source.pdf", "zh", "--with-furniture",
+        ])
+        self.assertTrue(translated.with_furniture)
+        self.assertFalse(hasattr(translated, "furniture"))
+
+        package = _parser().parse_args([
+            "package", "translate", "source.pcex", "zh", "--with-furniture",
+        ])
+        self.assertTrue(package.with_furniture)
+
+        converted = _parser().parse_args([
+            "pdf", "convert", "source.pdf", "--format", "epub",
+        ])
+        self.assertFalse(hasattr(converted, "with_furniture"))
+
+    def test_pdf_translation_rejects_furniture_for_non_pdf_output(self):
+        args = _parser().parse_args([
+            "pdf", "translate", "source.pdf", "zh", "--format", "epub", "--with-furniture",
+        ])
+        with self.assertRaisesRegex(SystemExit, "only with --format pdf"):
+            _translate_pdf(args)
+
+    def test_pdf_translation_forwards_furniture_to_extraction_and_patching(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = _parser().parse_args([
+                "pdf", "translate", str(root / "source.pdf"), "zh",
+                "--work-dir", str(root / "work"), "--with-furniture",
+            ])
+            craft = Mock()
+            result = _ExtractionResult(
+                craft=craft,
+                extraction=Mock(),
+                path=root / "work" / "book.pcex",
+                metering=OCRTokensMetering(0, 0),
+            )
+            transformer = Mock()
+            with patch("pdf_craft_tool.cli._extract", return_value=result) as extract, patch(
+                "pdf_craft_tool.cli._xml_translator", return_value=transformer,
+            ):
+                _translate_pdf(args)
+
+            self.assertEqual(extract.call_args.kwargs["includes_furniture"], True)
+            self.assertEqual(craft.translate_pdf.call_args.kwargs["with_furniture"], True)
+
+    def test_package_commands_open_extractions_through_craft_facade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "book.pcex"
+            source = root / "source.pdf"
+            handle = object()
+
+            translate_args = _parser().parse_args([
+                "package", "translate", str(package), "zh",
+                "--work-dir", str(root / "translate"),
+            ])
+            translate_craft = Mock()
+            translate_craft.open_extraction.return_value = handle
+            with patch("pdf_craft_tool.cli.load_project_env"), \
+                    patch("pdf_craft_tool.cli.PDFCraft", return_value=translate_craft), \
+                    patch("pdf_craft_tool.cli._xml_translator", return_value=Mock()):
+                _translate_package(translate_args)
+            translate_craft.open_extraction.assert_called_once_with(package)
+            self.assertIs(translate_craft.translate_extraction.call_args.args[0], handle)
+
+            render_args = _parser().parse_args([
+                "package", "render", str(package), "--format", "markdown",
+                "--work-dir", str(root / "render"),
+            ])
+            render_craft = Mock()
+            render_craft.open_extraction.return_value = handle
+            with patch("pdf_craft_tool.cli.PDFCraft", return_value=render_craft), \
+                    patch("pdf_craft_tool.cli._render") as render:
+                _render_package(render_args)
+            render_craft.open_extraction.assert_called_once_with(package)
+            self.assertIs(render.call_args.args[1], handle)
+
+            patch_args = _parser().parse_args([
+                "package", "patch-pdf", str(source), str(package),
+                "--work-dir", str(root / "patch"),
+                "--translation-id", "zh-main",
+            ])
+            patch_craft = Mock()
+            patch_craft.open_extraction.return_value = handle
+            with patch("pdf_craft_tool.cli.PDFCraft", return_value=patch_craft):
+                _patch_package_pdf(patch_args)
+            patch_craft.open_extraction.assert_called_once_with(package)
+            self.assertIs(patch_craft.patch_pdf_with_extraction.call_args.args[1], handle)
+            self.assertEqual(
+                patch_craft.patch_pdf_with_extraction.call_args.kwargs["translation_id"],
+                "zh-main",
+            )
+
     def test_smoke_exit_code_rejects_failed_and_skipped_reports(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,22 +146,47 @@ class TestPDFCraftTool(unittest.TestCase):
 
     def test_smoke_parser_exposes_package_render_and_translation_profiles(self):
         args = _parser().parse_args([
-            "smoke", "run", "--asset", "citation.pdf", "--route", "package-markdown",
+            "smoke", "run", "--asset", "pdf/citation.pdf", "--route", "package-markdown",
             "--translation-llm-profile", "translation", "--fill-llm-profile", "fill",
+            "--render-mode", "bilingual", "--translation-id", "smoke-zh",
+            "--target-language", "zh",
         ])
         self.assertEqual(args.route, "package-markdown")
         self.assertEqual(args.translation_llm_profile, "translation")
         self.assertEqual(args.fill_llm_profile, "fill")
+        self.assertEqual(args.render_mode, "bilingual")
+        self.assertEqual(args.translation_id, "smoke-zh")
+        self.assertEqual(args.target_language, "zh")
 
     def test_smoke_dry_run_does_not_require_project_env(self):
         args = _parser().parse_args([
-            "smoke", "run", "--asset", "citation.pdf", "--route", "markdown",
+            "smoke", "run", "--asset", "pdf/citation.pdf", "--route", "markdown",
             "--dry-run",
         ])
         with patch("pdf_craft_tool.cli.load_project_env") as load_env:
             from pdf_craft_tool.cli import _run_smoke
             _run_smoke(args)
         load_env.assert_not_called()
+
+    def test_page_repair_smoke_forwards_concurrency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            args = _parser().parse_args([
+                "smoke", "run",
+                "--asset", "analysis/citation_large_ocr",
+                "--route", "page-repair",
+                "--jev-baseline", "baseline.json",
+                "--page-repair-expected", "expected.json",
+                "--concurrency", "3",
+                "--output-root", str(output_root),
+                "--dry-run",
+            ])
+            from pdf_craft_tool.cli import _run_smoke
+            self.assertEqual(_run_smoke(args), 0)
+
+            manifest_path = next(output_root.glob("*/manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["run"]["page_repair"]["concurrency"], 3)
 
     def test_run_directories_use_a_date_and_shared_daily_sequence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,7 +309,7 @@ class TestPDFCraftTool(unittest.TestCase):
             source = root / "source.pdf"
             source.write_bytes(b"%PDF source")
             work_dir = root / "work"
-            (work_dir / "package" / "ocr").mkdir(parents=True)
+            (work_dir / "analysis" / "ocr").mkdir(parents=True)
             args = Namespace(
                 source=source,
                 dpi=None,

@@ -17,6 +17,7 @@ from pdf_craft import (
     DeepSeekOCRLocalConfig,
     DeepSeekOCRVendorConfig,
     LLM,
+    JEV,
     OCRConfig,
     OCRMode,
     UnlimitedOCRLocalConfig,
@@ -43,6 +44,18 @@ def load_env(path: Path) -> None:
             continue
         name, value = line.split("=", 1)
         os.environ.setdefault(name.strip(), value.strip().strip("\"'"))
+
+
+def create_jev_from_env() -> JEV:
+    """Create the official JEV configuration used by repository workflows."""
+
+    return JEV(
+        key=_required("PDF_CRAFT_JEV_API_KEY"),
+        url=_str("PDF_CRAFT_JEV_BASE_URL", default="https://api.typesafe.ai"),
+        model=_str("PDF_CRAFT_JEV_MODEL", default="jev-latest"),
+        timeout=_float("PDF_CRAFT_JEV_TIMEOUT_SECONDS", default=60.0),
+
+    )
 
 
 def create_ocr_config_from_env(mode: OCRMode | None = None) -> OCRConfig:

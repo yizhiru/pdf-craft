@@ -5,7 +5,8 @@ from pathlib import Path
 from PIL.Image import Image
 
 from ..common import ASSET_TAGS, AssetHub, remove_surrogates
-from ..error import OCRError
+from ..error import OCRBillingError, OCRError
+from ..policies import ErrorCallbackError
 from ..metering import AbortedCheck, check_aborted
 from ..ocr_config import (
     DeepSeekOCR2LocalConfig,
@@ -180,11 +181,8 @@ class PageExtractorNode:
     ) -> Page:
         self._validate_ocr_size(ocr_size)
         from doc_page_extractor.extraction_context import AbortError, TokenLimitError
-        from doc_page_extractor.plot import plot
         from doc_page_extractor.types import ExtractionContext
 
-        body_layouts: list[PageLayout] = []
-        footnotes_layouts: list[PageLayout] = []
         raw_image: Image | None = None
 
         if includes_raw_image:
@@ -199,8 +197,10 @@ class PageExtractorNode:
                 output_dir_path=temp_dir_path,
             )
             step_index: int = 1
-            generator = self._get_page_extractor().extract_page_results(
+            results = []
+            generator = self._page_results(
                 image=image,
+                page_index=page_index,
                 size=ocr_size,
                 stages=2 if includes_footnotes else 1,
                 context=context,
@@ -215,50 +215,119 @@ class PageExtractorNode:
                     raise
                 except TokenLimitError:
                     raise
+                except ErrorCallbackError:
+                    raise
                 except Exception as error:
+                    if _has_payment_required_status(error):
+                        raise OCRBillingError(page_index=page_index) from error
                     raise OCRError(
                         f"Failed to extract page {page_index} layout at stage {step_index}.",
                         page_index=page_index,
                         step_index=step_index,
                     ) from error
 
-                for page_layout, is_footnote in self._iter_page_layouts(
-                    image=image,
-                    structured=page_result.structured,
-                    asset_hub=asset_hub,
-                    stage_index=step_index,
-                    includes_footnotes=includes_footnotes,
-                ):
-                    if is_footnote:
-                        page_layout.order = len(footnotes_layouts)
-                        footnotes_layouts.append(page_layout)
-                    elif step_index == 1:
-                        page_layout.order = len(body_layouts)
-                        body_layouts.append(page_layout)
-                    elif page_layout.ref not in ASSET_TAGS:
-                        page_layout.order = len(footnotes_layouts)
-                        footnotes_layouts.append(page_layout)
-
-                check_aborted(aborted)
-                if plot_path is not None:
-                    plot_file_path = (
-                        plot_path / f"page_{page_index}_stage_{step_index}.png"
-                    )
-                    image = plot(image.copy(), page_result.layouts)
-                    image.save(plot_file_path, format="PNG")
-                    check_aborted(aborted)
-
+                results.append((image, page_result))
                 step_index += 1
 
-            return Page(
-                index=page_index,
-                image=raw_image,
-                body_layouts=body_layouts,
-                footnotes_layouts=footnotes_layouts,
+            return self.results2page(
+                results=results,
+                page_index=page_index,
+                asset_hub=asset_hub,
+                includes_footnotes=includes_footnotes,
+                raw_image=raw_image,
+                plot_path=plot_path,
                 input_tokens=context.input_tokens,
                 output_tokens=context.output_tokens,
+                aborted=aborted,
             )
 
+    def _page_results(self, *, image, page_index, size, stages, context, device_number):
+        """Own pass boundaries; upstream still performs each local recognition."""
+        from doc_page_extractor.redacter import background_color, redact, clip_layouts_to_unmasked_area
+        from doc_page_extractor.structure import build_structured_page
+        from ..extractor.progress import page_stage_sync
+        from .ocr import _redact_rectangles
+
+        if isinstance(self._ocr, (UnlimitedOCRLocalConfig, UnlimitedOCRVendorConfig)):
+            stages = 1
+        extractor = self._get_page_extractor()
+        rectangles = ()
+        result = None
+        for index in range(stages):
+            if index:
+                assert result is not None
+                page_stage_sync(page_index, 2)
+                rectangles = tuple(_redact_rectangles(image.size, (layout.det for layout in result.layouts)))
+                image = redact(image=image.copy(), fill_color=background_color(image), rectangles=rectangles)
+                page_stage_sync(page_index, 3)
+            generator = extractor.extract_page_results(
+                image=image, size=size, stages=1, context=context, device_number=device_number,
+            )
+            try:
+                for rendered, result in generator:
+                    if rectangles:
+                        result.layouts = clip_layouts_to_unmasked_area(result.layouts, rectangles)
+                        result.structured = build_structured_page(result.layouts)
+                    yield rendered, result
+            finally:
+                close = getattr(generator, 'close', None)
+                if close is not None:
+                    close()
+
+    def results2page(
+        self,
+        *,
+        results,
+        page_index: int,
+        asset_hub: AssetHub,
+        includes_footnotes: bool,
+        raw_image: Image | None,
+        plot_path: Path | None,
+        input_tokens: int,
+        output_tokens: int,
+        aborted: AbortedCheck,
+    ) -> Page:
+        """Convert already fetched OCR results without re-entering the vendor."""
+        from doc_page_extractor.plot import plot
+
+        body_layouts: list[PageLayout] = []
+        footnotes_layouts: list[PageLayout] = []
+        for step_index, (image, page_result) in enumerate(results, start=1):
+            for page_layout, is_footnote in self._iter_page_layouts(
+                image=image,
+                structured=page_result.structured,
+                asset_hub=asset_hub,
+                stage_index=step_index,
+                includes_footnotes=includes_footnotes,
+            ):
+                if is_footnote:
+                    page_layout.order = len(footnotes_layouts)
+                    footnotes_layouts.append(page_layout)
+                elif step_index == 1:
+                    page_layout.order = len(body_layouts)
+                    body_layouts.append(page_layout)
+                elif page_layout.ref not in ASSET_TAGS:
+                    page_layout.order = len(footnotes_layouts)
+                    footnotes_layouts.append(page_layout)
+
+            check_aborted(aborted)
+            if plot_path is not None:
+                plot_file_path = (
+                    plot_path / f"page_{page_index}_stage_{step_index}.png"
+                )
+                plotted = plot(image.copy(), page_result.layouts)
+                plotted.save(plot_file_path, format="PNG")
+                plotted.close()
+                check_aborted(aborted)
+
+        return Page(
+            index=page_index,
+            image=raw_image,
+            body_layouts=body_layouts,
+            footnotes_layouts=footnotes_layouts,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
     def _iter_page_layouts(
         self,
         image: Image,
@@ -355,3 +424,12 @@ class PageExtractorNode:
         if left >= right or top >= bottom:
             return None
         return left, top, right, bottom
+
+
+def _has_payment_required_status(error: Exception) -> bool:
+    """Recognise a provider's HTTP 402 without coupling to its client library."""
+    status_code = getattr(error, "status_code", None)
+    if status_code == 402:
+        return True
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) == 402

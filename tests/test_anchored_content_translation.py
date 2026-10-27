@@ -1,0 +1,987 @@
+"""AnchoredContent translation stays separate from NarrativeFlow."""
+
+# pylint: disable=protected-access
+
+from __future__ import annotations
+
+from pdf_craft import RetryPolicy
+
+
+import asyncio
+from copy import deepcopy
+import tempfile
+import threading
+import unittest
+from unittest.mock import AsyncMock
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, cast
+from xml.etree.ElementTree import parse, tostring
+
+from tiktoken import get_encoding
+
+from pdf_craft.common import read_xml, save_xml
+from pdf_craft.expression import ExpressionKind
+from pdf_craft import AsyncPDFCraft, ConcurrentExecutor, FixedCapacity, PDFCraft
+from pdf_craft.document import PDFCraftExtraction
+from pdf_craft.pipeline.pdf import PDFPatcher
+from pdf_craft.pipeline.pdf.pipeline import PDFTranslationPipeline
+from pdf_craft.llm import LLM
+from pdf_craft.markdown.paragraph import HTMLTag, tag_definition
+from pdf_craft.extractor.chapter.chapter import (
+    BlockMember,
+    Chapter,
+    InlineExpression,
+    SourceAsset,
+    SourceTextFragment,
+    StandaloneAsset,
+    TextFlowItem,
+    decode,
+    encode,
+)
+from pdf_craft.transformer import (
+    AnchoredContent,
+    AnchoredContentTranslation,
+    AnchoredContentXMLTransformer,
+)
+from pdf_craft.transformer.narrative_xml import (
+    NarrativeXMLTransformer,
+    _NarrativeAnchorProjection,
+    _render_chapter_source_text,
+)
+from pdf_craft.transformer.anchored_translation import (
+    _transform_batch_async,
+)
+from pdf_craft.transformer.xml_translator.segment import search_inline_segments, search_text_segments
+from pdf_craft.transformer.xml_translator.xml_translator.callbacks import warp_callbacks
+from pdf_craft.transformer.xml_translator.xml_translator.stream_mapper import XMLStreamMapper
+from pdf_craft.transformer.xml_translator.xml_translator.submitter import submit
+from pdf_craft.transformer.xml_translator.xml_translator.translator import XMLTranslator
+from tests.extraction_helpers import make_extraction
+
+
+class _TemplateTranslator:
+    """A deterministic XMLTranslator stand-in with real template round trips."""
+
+    def __init__(self) -> None:
+        self.sources: list[str] = []
+
+    async def translate_element(self, task, **kwargs):
+        callbacks = warp_callbacks(
+            interrupt_source_text_segments=kwargs["interrupt_source_text_segments"],
+            interrupt_translated_text_segments=kwargs["interrupt_translated_text_segments"],
+            interrupt_block_element=kwargs["interrupt_block_element"],
+
+        )
+        mapper = XMLStreamMapper(get_encoding("cl100k_base"), max_group_score=10_000)
+
+        async def translate_group(inline_segments):
+            self.sources.append(
+                "\n\n".join("".join(segment.text for segment in inline) for inline in inline_segments)
+            )
+            mappings = []
+            for inline in inline_segments:
+                template = inline.create_element()
+                for element in template.iter():
+                    if element.tag != "anchor" and element.text:
+                        element.text = f"T:{element.text}"
+                    if element.tag != "anchor" and element.tail:
+                        element.tail = f"T:{element.tail}"
+                assigned = inline.assign_attributes(template)
+                mappings.append((inline.parent, list(search_text_segments(assigned))))
+            return mappings
+
+        translated = task.element
+        async for element, mappings in mapper.map_stream_async(
+            elements=iter((task.element,)), callbacks=callbacks,
+            map=translate_group, window=1,
+        ):
+            translated = submit(element, task.action, mappings)
+        return translated, task.payload
+
+
+class _BrokenAnchorTranslator:
+    async def translate_element(self, task, **_kwargs):
+        parent = next(node for node in task.element.iter() if node.find("anchor") is not None)
+        parent.remove(parent.find("anchor"))
+        return task.element, task.payload
+
+
+class _AssetTranslator:
+    def __init__(self) -> None:
+        self.calls: list[list[AnchoredContent]] = []
+
+    async def transform_assets(
+        self, assets: Sequence[AnchoredContent],
+    ) -> Sequence[AnchoredContentTranslation | None]:
+        self.calls.append(list(assets))
+        return [
+            AnchoredContentTranslation(
+                asset.identity,
+                [f"T:{_text(asset.asset.title)}"],
+                [f"T:{_text(asset.asset.content)}"],
+                [f"T:{_text(asset.asset.caption)}"],
+            )
+            for asset in assets
+        ]
+
+
+class _AsyncAssetTranslator:
+    def __init__(self) -> None:
+        self.thread_id: int | None = None
+
+    async def transform_assets(
+        self, assets: Sequence[AnchoredContent],
+    ) -> Sequence[AnchoredContentTranslation | None]:
+        await asyncio.sleep(0)
+        self.thread_id = threading.get_ident()
+        return [
+            AnchoredContentTranslation(
+                asset.identity,
+                ["Async title"],
+                ["Async content"],
+                ["Async caption"],
+            )
+            for asset in assets
+        ]
+
+
+class _XMLTaskTranslator:
+    def __init__(self) -> None:
+        self.sources: list[str] = []
+
+    async def translate_element(self, task, **kwargs):
+        self.sources.extend(
+            segment.text
+            for segment in kwargs["interrupt_source_text_segments"](
+                search_text_segments(task.element)
+            )
+        )
+        for element in task.element.iter():
+            # Indentation is not submitted as translatable text by the real
+            # segment adapter; the stand-in must not invent text in that slot.
+            if element.tag != "translation-context" and element.text and element.text.strip():
+                element.text = f"T:{element.text}"
+        return task.element, task.payload
+
+
+class _ReorderedAssetXMLTaskTranslator(_XMLTaskTranslator):
+    """A hostile transport that changes wrapper order but keeps slot tokens."""
+
+    async def translate_element(self, task, **kwargs):
+        translated, payload = await super().translate_element(task, **kwargs)
+        flow = translated.find("flow")
+        assert flow is not None
+        flow[:] = list(reversed(flow))
+        return translated, payload
+
+
+class _ChangedAssetSlotXMLTaskTranslator(_XMLTaskTranslator):
+    """A hostile transport that corrupts one stable asset slot."""
+
+    async def translate_element(self, task, **kwargs):
+        translated, payload = await super().translate_element(task, **kwargs)
+        asset = translated.find("flow/standalone-asset/asset")
+        assert asset is not None
+        asset.set("translation_slot", "corrupted")
+        return translated, payload
+
+
+class _BrokenTableFormulaXMLTaskTranslator(_XMLTaskTranslator):
+    """A hostile transport that changes an inline formula's table position."""
+
+    def __init__(self, action: str) -> None:
+        super().__init__()
+        self.action = action
+
+    async def translate_element(self, task, **kwargs):
+        translated, payload = await super().translate_element(task, **kwargs)
+        cell = translated.find("flow/standalone-asset/asset/content/table/tr/td")
+        if cell is None:
+            return translated, payload
+        expression = cell.find("inline_expr")
+        assert expression is not None
+        row = next(node for node in translated.iter() if node.tag == "tr")
+        if self.action == "move":
+            cell.remove(expression)
+            row.append(expression)
+        elif self.action == "copy":
+            row.append(deepcopy(expression))
+        elif self.action == "drop":
+            cell.remove(expression)
+        else:
+            raise AssertionError(f"unknown action: {self.action}")
+        return translated, payload
+
+
+class _RepositionedTableFormulaXMLTaskTranslator(_XMLTaskTranslator):
+    """A hostile transport that repositions formulas within one table cell."""
+
+    def __init__(self, action: str) -> None:
+        super().__init__()
+        self.action = action
+
+    async def translate_element(self, task, **kwargs):
+        translated, payload = await super().translate_element(task, **kwargs)
+        cell = translated.find("flow/standalone-asset/asset/content/table/tr/td")
+        if cell is None:
+            return translated, payload
+        expressions = cell.findall("inline_expr")
+        if self.action == "move_to_start":
+            expression = expressions[0]
+            expression.tail = f"{cell.text or ''}{expression.tail or ''}"
+            cell.text = None
+        elif self.action == "move_to_end":
+            expression = expressions[0]
+            cell.text = f"{cell.text or ''}{expression.tail or ''}"
+            expression.tail = None
+        elif self.action == "swap":
+            first, second = expressions
+            cell.remove(first)
+            cell.remove(second)
+            cell.extend((second, first))
+        else:
+            raise AssertionError(f"unknown action: {self.action}")
+        return translated, payload
+
+
+class _WrongIdentityAssetTransformer:
+    def __init__(self) -> None:
+        self.calls: list[list[AnchoredContent]] = []
+
+    async def transform_assets(self, assets: Sequence[AnchoredContent]):
+        self.calls.append(list(assets))
+        return [
+            AnchoredContentTranslation(("wrong", 0, 0), ["wrong"], [], [])
+            for _ in assets
+        ]
+
+
+class _ResponseContext:
+    def __init__(self, responses: Sequence[str]) -> None:
+        self._responses = iter(responses)
+        self.calls = 0
+        self.messages = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def request(self, *_args, **_kwargs):
+        self.messages.append(_args)
+        self.calls += 1
+        return next(self._responses)
+
+
+class _ResponseRuntime:
+    def __init__(self, responses: Sequence[str], runtime) -> None:
+        self.context_value = _ResponseContext(responses)
+        self.encoding = runtime.encoding
+        self.template = runtime.template
+
+    def context(self, **_kwargs):
+        return self.context_value
+
+
+class _CapturePatcher:
+    """Capture the actual PDF patch plan without producing an output file."""
+
+    def __init__(self) -> None:
+        self.replacements = []
+
+    async def patch(self, _source, _target, replacements, **_kwargs) -> None:
+        self.replacements = list(replacements)
+
+
+def _repairing_translator(fill_responses: Sequence[str]) -> tuple[XMLTranslator, _ResponseRuntime]:
+    config = LLM("test", "https://example.invalid/v1", "test", "cl100k_base")
+    translator = XMLTranslator(
+        config, config, "English", None,   10_000, 10_000,
+        executor=ConcurrentExecutor(FixedCapacity(1)),
+     retry_policy=RetryPolicy(fill=max(0, (2) - 1)))
+    async def translate_text(text: str) -> str:
+        return text
+
+    translator._translate_text_async = translate_text  # type: ignore[method-assign]
+    runtime = _ResponseRuntime(fill_responses, translator._fill_runtime)
+    translator._fill_runtime = runtime  # type: ignore[assignment]
+    return translator, runtime
+
+
+def _pdf_patch_text(chapter: Chapter) -> str:
+    """Run a translated chapter through the PDF patch planning boundary."""
+    page_sizes = {
+        fragment.page_index: (100, 100)
+        for item in chapter.flow_items
+        if isinstance(item, TextFlowItem)
+        for fragment in item.children
+        if isinstance(fragment, SourceTextFragment)
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        extraction = make_extraction(root / "source", page_pixel_sizes=page_sizes)
+        save_xml(encode(chapter), root / "source/chapters/chapter_head.xml")
+        first_text = next(item for item in chapter.flow_items if isinstance(item, TextFlowItem))
+        first_fragment = next(
+            child for child in first_text.children if isinstance(child, SourceTextFragment)
+        )
+        (root / "source/translation.xml").write_text(
+            "<translation><narrative><paragraph chapter_id='head' "
+            f"page_index='{first_fragment.page_index}' order='{first_fragment.source_order}' "
+            "state='translated'/></narrative></translation>",
+            encoding="utf-8",
+        )
+        capture = _CapturePatcher()
+        asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+            Path("input.pdf"), Path("output.pdf"), extraction,
+        ))
+        assert len(capture.replacements) == 1
+        return capture.replacements[0].text
+
+
+class AnchoredContentTranslationTests(unittest.TestCase):
+    def test_narrative_source_text_keeps_fragments_in_one_text_flow_continuous(self):
+        chapter = Chapter(None, -1, [
+            TextFlowItem("body", 0, [
+                SourceTextFragment(1, 1, (1, 1, 90, 15), ["How-"]),
+                SourceAsset(1, "image", (20, 20, 80, 80), asset_hash="a" * 64),
+                SourceTextFragment(1, 2, (1, 85, 90, 99), ["ever"]),
+            ]),
+            TextFlowItem("body", 0, [
+                SourceTextFragment(1, 3, (1, 100, 90, 115), ["Next paragraph."]),
+            ]),
+        ])
+        root = encode(chapter)
+        anchors = _NarrativeAnchorProjection(root)
+        anchors.replace_assets()
+
+        source = _render_chapter_source_text(list(search_inline_segments(search_text_segments(root))))
+
+        self.assertEqual(source, "How-ever\n\nNext paragraph.")
+
+    def test_narrative_translation_uses_anchor_and_restores_source_asset(self):
+        image = SourceAsset(
+            1, "image", (20, 20, 80, 80),
+            title=["Secret title"], content=["Secret image text"], caption=["Secret caption"],
+            asset_hash="a" * 64,
+        )
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), ["Before."]),
+            image,
+            SourceTextFragment(1, 2, (1, 85, 90, 99), ["After."]),
+        ])])
+        translator = _TemplateTranslator()
+
+        translated = asyncio.run(NarrativeXMLTransformer(translator).transform(chapter))
+
+        source = "\n".join(translator.sources)
+        self.assertIn("Before.", source)
+        self.assertIn("After.", source)
+        self.assertNotIn("[anchored content]", source)
+        self.assertNotIn("Secret title", source)
+        self.assertNotIn("Secret image text", source)
+        self.assertNotIn("Secret caption", source)
+
+        text = translated.flow_items[0]
+        assert isinstance(text, TextFlowItem)
+        self.assertEqual(text.children[0].content, ["T:Before."])
+        self.assertEqual(text.children[2].content, ["T:After."])
+        self.assertEqual(text.children[1], image)
+        self.assertNotIn("anchor", tostring(encode(translated), encoding="unicode"))
+
+    def test_narrative_translation_rejects_lost_anchor_from_non_protocol_translator(self):
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), ["Before."]),
+            SourceAsset(1, "image", (20, 20, 80, 80), asset_hash="a" * 64),
+            SourceTextFragment(1, 2, (1, 85, 90, 99), ["After."]),
+        ])])
+
+        with self.assertRaisesRegex(ValueError, "anchored-content structure"):
+            asyncio.run(NarrativeXMLTransformer(_BrokenAnchorTranslator()).transform(chapter))
+
+    def test_narrative_translation_restores_multiple_assets_in_source_order(self):
+        first = SourceAsset(1, "image", (10, 20, 20, 30), asset_hash="a" * 64)
+        second = SourceAsset(1, "table", (30, 20, 40, 30), asset_hash="b" * 64)
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 10), ["One."]),
+            first,
+            SourceTextFragment(1, 2, (1, 31, 90, 40), ["Two."]),
+            second,
+            SourceTextFragment(1, 3, (1, 41, 90, 50), ["Three."]),
+        ])])
+        translator = _TemplateTranslator()
+
+        translated = asyncio.run(NarrativeXMLTransformer(translator).transform(chapter))
+
+        item = translated.flow_items[0]
+        assert isinstance(item, TextFlowItem)
+        self.assertEqual(
+            [type(child) for child in item.children],
+            [SourceTextFragment, SourceAsset, SourceTextFragment, SourceAsset, SourceTextFragment],
+        )
+        self.assertEqual(item.children[1], first)
+        self.assertEqual(item.children[3], second)
+        self.assertNotIn("[anchored content]", "\n".join(translator.sources))
+
+    def test_narrative_translation_hides_standalone_asset_text_without_an_anchor(self):
+        table = SourceAsset(
+            1, "table", (1, 30, 90, 80), title=["Table title"],
+            content=["Table cells"], caption=["Table caption"], asset_hash="e" * 64,
+        )
+        chapter = Chapter(None, -1, [
+            TextFlowItem("body", 0, [SourceTextFragment(1, 1, (1, 1, 90, 20), ["Narrative."])]),
+            StandaloneAsset(table),
+        ])
+        translator = _TemplateTranslator()
+
+        translated = asyncio.run(NarrativeXMLTransformer(translator).transform(chapter))
+
+        source = "\n".join(translator.sources)
+        self.assertIn("Narrative.", source)
+        self.assertNotIn("[anchored content]", source)
+        self.assertNotIn("Table title", source)
+        self.assertNotIn("Table cells", source)
+        self.assertNotIn("Table caption", source)
+        self.assertEqual(translated.flow_items[1], StandaloneAsset(table))
+
+    def test_anchor_protocol_retries_missing_duplicate_renamed_and_reordered_tokens(self):
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), ["Before."]),
+            SourceAsset(1, "image", (20, 20, 40, 40), asset_hash="a" * 64),
+            SourceTextFragment(1, 2, (1, 45, 90, 60), ["Middle."]),
+            SourceAsset(1, "table", (20, 65, 40, 80), asset_hash="b" * 64),
+            SourceTextFragment(1, 3, (1, 85, 90, 99), ["After."]),
+        ])])
+        valid = (
+            '<xml><fragment id="1">Before.</fragment><anchor anchor_key="0"/>'
+            '<fragment id="2">Middle.</fragment><anchor anchor_key="1"/>'
+            '<fragment id="3">After.</fragment></xml>'
+        )
+        invalid_responses = (
+            '<xml><fragment id="1">Before.</fragment><fragment id="2">Middle.</fragment>'
+            '<anchor anchor_key="1"/><fragment id="3">After.</fragment></xml>',
+            '<xml><fragment id="1">Before.</fragment><anchor anchor_key="0"/>'
+            '<anchor anchor_key="0"/><fragment id="2">Middle.</fragment>'
+            '<anchor anchor_key="1"/><fragment id="3">After.</fragment></xml>',
+            '<xml><fragment id="1">Before.</fragment><marker anchor_key="0"/>'
+            '<fragment id="2">Middle.</fragment><anchor anchor_key="1"/>'
+            '<fragment id="3">After.</fragment></xml>',
+            '<xml><fragment id="1">Before.</fragment><anchor anchor_key="1"/>'
+            '<fragment id="2">Middle.</fragment><anchor anchor_key="0"/>'
+            '<fragment id="3">After.</fragment></xml>',
+            '<xml><fragment id="1">Before.</fragment><fragment id="2">Middle.</fragment>'
+            '<fragment id="3">After.</fragment><anchor anchor_key="0"/>'
+            '<anchor anchor_key="1"/></xml>',
+            '<xml><fragment id="1">Before.</fragment><anchor anchor_key="0">model text</anchor>'
+            '<fragment id="2">Middle.</fragment><anchor anchor_key="1"/>'
+            '<fragment id="3">After.</fragment></xml>',
+        )
+
+        for invalid in invalid_responses:
+            with self.subTest(invalid=invalid):
+                translator, runtime = _repairing_translator((invalid, valid))
+                translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter))
+                self.assertEqual(runtime.context_value.calls, 2)
+                fill_request = runtime.context_value.messages[0][0][1].message
+                self.assertIn('<anchor anchor_key="0"/>', fill_request)
+                self.assertIn('<anchor anchor_key="1"/>', fill_request)
+                self.assertNotIn("[anchored content]", fill_request)
+                self.assertEqual(translated, chapter)
+
+    def test_fill_repairs_anchor_boundary_to_match_canonical_translation(self):
+        """An asset anchor is structural: it cannot acquire a visible space."""
+        image = SourceAsset(1, "image", (20, 20, 80, 80))
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), ["How"]),
+            image,
+            SourceTextFragment(1, 2, (1, 85, 90, 99), ["ever, the Council."]),
+        ])])
+        incorrect = (
+            '<xml><fragment id="1">How </fragment><anchor anchor_key="0"/>'
+            '<fragment id="2"> ever, the Council.</fragment></xml>'
+        )
+        corrected = (
+            '<xml><fragment id="1">However</fragment><anchor anchor_key="0"/>'
+            '<fragment id="2">, the Council.</fragment></xml>'
+        )
+        translator, runtime = _repairing_translator((incorrect, corrected))
+        translator._translate_text_async = AsyncMock(return_value="However, the Council.")  # type: ignore[method-assign]
+
+        translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter))
+
+        text = translated.flow_items[0]
+        assert isinstance(text, TextFlowItem)
+        first, restored_image, second = text.children
+        assert isinstance(first, SourceTextFragment)
+        assert isinstance(second, SourceTextFragment)
+        self.assertEqual(restored_image, image)
+        self.assertEqual(_text(first.content) + _text(second.content), "However, the Council.")
+        self.assertEqual(_pdf_patch_text(translated), "However, the Council.")
+        self.assertEqual(runtime.context_value.calls, 2)
+        initial_messages = runtime.context_value.messages[0][0]
+        self.assertIn("Canonical visible-text constraint", initial_messages[-1].message)
+        retry_messages = runtime.context_value.messages[1][0]
+        self.assertIn("Anchors are zero-width", retry_messages[-1].message)
+
+    def test_fill_repairs_plain_fragment_boundary_to_match_canonical_translation(self):
+        """A cross-page fragment split has no anchor but obeys the same rule."""
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), ["corrup"]),
+            SourceTextFragment(2, 2, (1, 1, 90, 15), ["tion is harmful."]),
+        ])])
+        incorrect = (
+            '<xml><fragment id="1">corrup </fragment>'
+            '<fragment id="2"> tion is harmful.</fragment></xml>'
+        )
+        corrected = (
+            '<xml><fragment id="1">corruption</fragment>'
+            '<fragment id="2"> is harmful.</fragment></xml>'
+        )
+        translator, runtime = _repairing_translator((incorrect, corrected))
+        translator._translate_text_async = AsyncMock(return_value="corruption is harmful.")  # type: ignore[method-assign]
+
+        translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter))
+
+        text = translated.flow_items[0]
+        assert isinstance(text, TextFlowItem)
+        fragments = [child for child in text.children if isinstance(child, SourceTextFragment)]
+        self.assertEqual("".join(_text(fragment.content) for fragment in fragments), "corruption is harmful.")
+        self.assertEqual(_pdf_patch_text(translated), "corruption is harmful.")
+        self.assertEqual(runtime.context_value.calls, 2)
+        retry_messages = runtime.context_value.messages[1][0]
+        self.assertIn("canonical translation", retry_messages[-1].message)
+
+    def test_invalid_formula_fill_is_explicitly_missing_when_recovery_allowed(self):
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), [
+                "Character ",
+                InlineExpression(ExpressionKind.INLINE_PAREN, r"\chi"),
+                " vanishes.",
+            ]),
+        ])])
+        incorrect = (
+            '<xml><fragment id="1"><expression id="2"> \\(\\chi\\) </expression>'
+            'Character vanishes.</fragment></xml>'
+        )
+        corrected = (
+            '<xml><fragment id="1">Character <expression id="2"> \\(\\chi\\) '
+            '</expression> vanishes.</fragment></xml>'
+        )
+        translator, runtime = _repairing_translator((incorrect, corrected))
+        translator._translate_text_async = AsyncMock(return_value=r"Character \(\chi\) vanishes.")  # type: ignore[method-assign]
+
+        translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter, error_policy=True))
+
+        self.assertEqual(runtime.context_value.calls, 2)
+        self.assertTrue(getattr(translated.flow_items[0], "_translation_missing"))
+        text = translated.flow_items[0]
+        assert isinstance(text, TextFlowItem)
+        content = text.children[0].content
+        self.assertEqual(_text(content), "Character  vanishes.")
+        self.assertIsInstance(content[1], InlineExpression)
+
+    def test_fill_restores_source_formula_ids_only_after_accepting_canonical_text(self):
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), [
+                "A character ",
+                InlineExpression(ExpressionKind.INLINE_PAREN, r"\chi"),
+                " modulo ",
+                InlineExpression(ExpressionKind.INLINE_PAREN, "q"),
+                ".",
+            ]),
+        ])])
+        filled = (
+            '<xml><fragment id="1">模 <expression id="3">q'
+            '</expression> 的特征 <expression id="2">χ'
+            '</expression>。</fragment></xml>'
+        )
+        translator, runtime = _repairing_translator((filled,))
+        translator._translate_text_async = AsyncMock(return_value="模 q 的特征 χ。")  # type: ignore[method-assign]
+
+        translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter))
+
+        self.assertEqual(runtime.context_value.calls, 1)
+        text = translated.flow_items[0]
+        assert isinstance(text, TextFlowItem)
+        content = text.children[0].content
+        formulas = [item for item in content if isinstance(item, InlineExpression)]
+        self.assertEqual([formula.content for formula in formulas], ["q", r"\chi"])
+        self.assertNotIn(
+            "__PDF_CRAFT_CHAPTER_FORMULA_ID",
+            tostring(encode(translated), encoding="unicode"),
+        )
+
+    def test_fill_validates_one_owner_when_canonical_translation_has_blank_lines(self):
+        """A translated paragraph break is content, not a TextFlowItem separator."""
+        chapter = Chapter(None, -1, [TextFlowItem("body", 0, [
+            SourceTextFragment(1, 1, (1, 1, 90, 15), ["First source."]),
+            SourceTextFragment(1, 2, (1, 16, 90, 30), ["Second source."]),
+        ])])
+        incorrect = (
+            '<xml><fragment id="1">First. </fragment>'
+            '<fragment id="2"> Second.</fragment></xml>'
+        )
+        corrected = (
+            '<xml><fragment id="1">First.</fragment>'
+            '<fragment id="2"> Second.</fragment></xml>'
+        )
+        translator, runtime = _repairing_translator((incorrect, corrected))
+        translator._translate_text_async = AsyncMock(return_value="First.\n\nSecond.")  # type: ignore[method-assign]
+
+        translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter))
+
+        text = translated.flow_items[0]
+        assert isinstance(text, TextFlowItem)
+        fragments = [child for child in text.children if isinstance(child, SourceTextFragment)]
+        self.assertEqual("".join(_text(fragment.content) for fragment in fragments), "First. Second.")
+        self.assertEqual(_pdf_patch_text(translated), "First. Second.")
+        self.assertEqual(runtime.context_value.calls, 2)
+        retry_messages = runtime.context_value.messages[1][0]
+        self.assertIn("Expected 'First. Second.'", retry_messages[-1].message)
+
+    def test_canonical_fill_keeps_a_separate_first_stage_result_per_text_owner(self):
+        """Owner identity, not translated paragraph spacing, defines canonical scope."""
+        chapter = Chapter(None, -1, [
+            TextFlowItem("body", 0, [
+                SourceTextFragment(1, 1, (1, 1, 90, 15), ["First source."]),
+            ]),
+            TextFlowItem("body", 0, [
+                SourceTextFragment(1, 2, (1, 16, 90, 30), ["Second source."]),
+            ]),
+        ])
+        translator, runtime = _repairing_translator((
+            '<xml><fragment id="1">First canonical.</fragment></xml>',
+            '<xml><fragment id="1">Second canonical.</fragment></xml>',
+        ))
+        sources: list[str] = []
+
+        async def translate(source: str) -> str:
+            sources.append(source)
+            return f"{source[:-7]} canonical."
+
+        translator._translate_text_async = translate  # type: ignore[method-assign]
+
+        translated = asyncio.run(NarrativeXMLTransformer(cast(Any, translator)).transform(chapter))
+
+        self.assertEqual(sources, ["First source.", "Second source."])
+        self.assertEqual(runtime.context_value.calls, 2)
+        contents = [
+            _text(item.children[0].content)
+            for item in translated.flow_items
+            if isinstance(item, TextFlowItem)
+        ]
+        self.assertEqual(contents, ["First canonical.", "Second canonical."])
+
+    def test_independent_stage_translates_asset_fields_and_records_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source = make_extraction(source_root, page_pixel_sizes={1: (100, 100)})
+            image = SourceAsset(
+                1, "image", (20, 20, 60, 60), title=["Image title"],
+                content=["Image OCR"], caption=["Image caption"], asset_hash="a" * 64,
+            )
+            table = SourceAsset(
+                1, "table", (1, 65, 90, 95), title=["Table title"],
+                content=["Table cell"], caption=["Table caption"], asset_hash="b" * 64,
+            )
+            (source_root / "assets" / f"{image.asset_hash}.png").write_bytes(b"image")
+            (source_root / "assets" / f"{table.asset_hash}.png").write_bytes(b"table")
+            chapter = Chapter(7, 0, [
+                TextFlowItem("heading", 0, [SourceTextFragment(1, 0, (1, 1, 90, 10), ["Chapter"])]),
+                TextFlowItem("body", 0, [
+                    SourceTextFragment(1, 1, (1, 12, 90, 19), ["Before image."]),
+                    image,
+                    SourceTextFragment(1, 2, (1, 61, 90, 64), ["After image."]),
+                ]),
+                StandaloneAsset(table),
+            ])
+            save_xml(encode(chapter), source_root / "chapters/chapter_7.xml")
+            translator = _AssetTranslator()
+
+            translated = PDFCraft().translate_anchored_contents(
+                source, root / "translated.pcex", translator,
+            )
+
+            self.assertEqual(len(translator.calls), 1)
+            payloads = translator.calls[0]
+            self.assertEqual([payload.identity for payload in payloads], [("7", 1, 1), ("7", 2, -1)])
+            self.assertIn("Before image.", payloads[0].context)
+            self.assertIn("After image.", payloads[0].context)
+            with translated._materialize() as paths:
+                result = decode(read_xml(paths.chapters / "chapter_7.xml"))
+                embedded = result.flow_items[1]
+                assert isinstance(embedded, TextFlowItem)
+                embedded_asset = embedded.children[1]
+                assert isinstance(embedded_asset, SourceAsset)
+                self.assertEqual(embedded_asset.title, ["T:Image title"])
+                self.assertEqual(embedded_asset.caption, ["T:Image caption"])
+                standalone = result.flow_items[2]
+                assert isinstance(standalone, StandaloneAsset)
+                self.assertEqual(standalone.asset.content, ["T:Table cell"])
+                coverage = parse(paths.translation).getroot()
+                self.assertEqual(
+                    [
+                        (entry.get("chapter_id"), entry.get("flow_index"), entry.get("child_index"), entry.get("state"))
+                        for entry in coverage.findall("anchored/asset")
+                    ],
+                    [("7", "1", "1", "translated"), ("7", "2", "-1", "translated")],
+                )
+            translated._validate()
+
+    def test_xml_adapter_keeps_context_transient_and_maps_all_asset_fields(self):
+        source = SourceAsset(
+            1, "image", (1, 1, 10, 10), title=["Title"], content=["Content"], caption=["Caption"],
+        )
+        translator = _XMLTaskTranslator()
+        result = asyncio.run(AnchoredContentXMLTransformer(translator).transform_assets((
+            AnchoredContent("head", 0, 1, source, "Nearby narrative."),
+        )))
+
+        self.assertEqual(
+            result[0],
+            AnchoredContentTranslation(("head", 0, 1), ["T:Title"], ["T:Content"], ["T:Caption"]),
+        )
+        self.assertIn("Nearby narrative.", "\n".join(translator.sources))
+
+    def test_xml_adapter_uses_slot_identity_when_transport_reorders_assets(self):
+        first = SourceAsset(1, "image", (1, 1, 10, 10), title=["first"])
+        second = SourceAsset(1, "table", (1, 11, 10, 20), title=["second"])
+        result = asyncio.run(AnchoredContentXMLTransformer(
+            _ReorderedAssetXMLTaskTranslator()
+        ).transform_assets((
+            AnchoredContent("head", 0, 0, first, "first context"),
+            AnchoredContent("head", 1, -1, second, "second context"),
+        )))
+
+        self.assertEqual([item.identity for item in result if item], [("head", 0, 0), ("head", 1, -1)])
+        self.assertEqual([item.title for item in result if item], [["T:first"], ["T:second"]])
+
+    def test_xml_adapter_preserves_whole_batch_when_a_slot_changes(self):
+        first = SourceAsset(1, "image", (1, 1, 10, 10), title=["first"])
+        second = SourceAsset(1, "table", (1, 11, 10, 20), title=["second"])
+        result = asyncio.run(AnchoredContentXMLTransformer(
+            _ChangedAssetSlotXMLTaskTranslator()
+        ).transform_assets((
+            AnchoredContent("head", 0, 0, first, "first context"),
+            AnchoredContent("head", 1, -1, second, "second context"),
+        ), error_policy=True))
+
+        self.assertEqual(result, (None, None))
+
+    def test_xml_adapter_preserves_table_when_formula_structure_changes(self):
+        table_tag = tag_definition("table")
+        row_tag = tag_definition("tr")
+        cell_tag = tag_definition("td")
+        assert table_tag is not None
+        assert row_tag is not None
+        assert cell_tag is not None
+        cell = HTMLTag[BlockMember](
+            cell_tag,
+            [],
+            ["value ", InlineExpression(ExpressionKind.INLINE_DOLLAR, "x")],
+        )
+        row = HTMLTag[BlockMember](row_tag, [], [cell])
+        table_content = HTMLTag[BlockMember](table_tag, [], [row])
+        table = SourceAsset(
+            1,
+            "table",
+            (1, 1, 20, 20),
+            content=[table_content],
+        )
+        payload = AnchoredContent("head", 0, -1, table, "")
+
+        for action in ("move", "copy", "drop"):
+            with self.subTest(action=action):
+                result = asyncio.run(AnchoredContentXMLTransformer(
+                    _BrokenTableFormulaXMLTaskTranslator(action)
+                ).transform_assets((payload,), error_policy=True))
+
+                self.assertEqual(result, (None,))
+
+    def test_xml_adapter_preserves_table_when_formula_moves_within_cell(self):
+        table_tag = tag_definition("table")
+        row_tag = tag_definition("tr")
+        cell_tag = tag_definition("td")
+        assert table_tag is not None
+        assert row_tag is not None
+        assert cell_tag is not None
+        cell = HTMLTag[BlockMember](
+            cell_tag,
+            [],
+            ["before ", InlineExpression(ExpressionKind.INLINE_DOLLAR, "x"), " after"],
+        )
+        row = HTMLTag[BlockMember](row_tag, [], [cell])
+        table = SourceAsset(
+            1, "table", (1, 1, 20, 20),
+            content=[HTMLTag[BlockMember](table_tag, [], [row])],
+        )
+        payload = AnchoredContent("head", 0, -1, table, "")
+
+        for action in ("move_to_start", "move_to_end"):
+            with self.subTest(action=action):
+                result = asyncio.run(AnchoredContentXMLTransformer(
+                    _RepositionedTableFormulaXMLTaskTranslator(action)
+                ).transform_assets((payload,), error_policy=True))
+
+                self.assertEqual(result, (None,))
+
+    def test_xml_adapter_preserves_table_when_same_shape_formulas_are_swapped(self):
+        table_tag = tag_definition("table")
+        row_tag = tag_definition("tr")
+        cell_tag = tag_definition("td")
+        assert table_tag is not None
+        assert row_tag is not None
+        assert cell_tag is not None
+        cell = HTMLTag[BlockMember](
+            cell_tag,
+            [],
+            [
+                "before ",
+                InlineExpression(ExpressionKind.INLINE_DOLLAR, "x"),
+                " between ",
+                InlineExpression(ExpressionKind.INLINE_DOLLAR, "y"),
+                " after",
+            ],
+        )
+        row = HTMLTag[BlockMember](row_tag, [], [cell])
+        table = SourceAsset(
+            1, "table", (1, 1, 20, 20),
+            content=[HTMLTag[BlockMember](table_tag, [], [row])],
+        )
+        payload = AnchoredContent("head", 0, -1, table, "")
+
+        result = asyncio.run(AnchoredContentXMLTransformer(
+            _RepositionedTableFormulaXMLTaskTranslator("swap")
+        ).transform_assets((payload,), error_policy=True))
+
+        self.assertEqual(result, (None,))
+
+    def test_xml_adapter_preserves_failed_batch_without_hidden_singleton_retries(self):
+        table_tag = tag_definition("table")
+        row_tag = tag_definition("tr")
+        cell_tag = tag_definition("td")
+        assert table_tag is not None
+        assert row_tag is not None
+        assert cell_tag is not None
+        expression = InlineExpression(ExpressionKind.INLINE_DOLLAR, "x")
+        cell = HTMLTag[BlockMember](cell_tag, [], ["value ", expression])
+        row = HTMLTag[BlockMember](row_tag, [], [cell])
+        table = SourceAsset(
+            1, "table", (1, 1, 20, 20),
+            content=[HTMLTag[BlockMember](table_tag, [], [row])],
+        )
+        image = SourceAsset(
+            1, "image", (21, 1, 40, 20), title=["Image title"],
+        )
+        payloads = (
+            AnchoredContent("head", 0, -1, table, ""),
+            AnchoredContent("head", 1, -1, image, ""),
+        )
+        transformer = AnchoredContentXMLTransformer(
+            _RepositionedTableFormulaXMLTaskTranslator("move_to_end")
+        )
+
+        result = asyncio.run(_transform_batch_async(payloads, transformer, error_policy=True))
+
+        self.assertIsNone(result[0])
+        self.assertIsNone(result[1])
+
+    def test_generic_transformer_preserves_assets_when_result_identity_is_wrong(self):
+        first = AnchoredContent("head", 0, 0, SourceAsset(1, "image", (1, 1, 10, 10)), "")
+        second = AnchoredContent("head", 1, -1, SourceAsset(1, "table", (1, 11, 10, 20)), "")
+        transformer = _WrongIdentityAssetTransformer()
+
+        with self.assertRaisesRegex(ValueError, 'source identities'):
+            asyncio.run(_transform_batch_async((first, second), transformer))
+        self.assertEqual([len(call) for call in transformer.calls], [2])
+
+    def test_asset_without_extracted_text_is_preserved_without_a_translation_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source = make_extraction(source_root, page_pixel_sizes={1: (100, 100)})
+            image = SourceAsset(1, "image", (1, 1, 20, 20), asset_hash="c" * 64)
+            (source_root / "assets" / f"{image.asset_hash}.png").write_bytes(b"image")
+            save_xml(
+                encode(Chapter(None, -1, [StandaloneAsset(image)])),
+                source_root / "chapters/chapter_head.xml",
+            )
+            translator = _AssetTranslator()
+
+            translated = PDFCraft().translate_anchored_contents(
+                source, root / "translated.pcex", translator,
+            )
+
+            self.assertEqual(translator.calls, [])
+            with translated._materialize() as paths:
+                entry = parse(paths.translation).find("anchored/asset")
+                assert entry is not None
+                self.assertEqual(entry.get("state"), "preserved")
+
+    def test_coverage_rejects_an_unknown_asset_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            make_extraction(source_root, page_pixel_sizes={1: (100, 100)})
+            image = SourceAsset(1, "image", (1, 1, 20, 20), asset_hash="d" * 64)
+            (source_root / "assets" / f"{image.asset_hash}.png").write_bytes(b"image")
+            save_xml(
+                encode(Chapter(None, -1, [StandaloneAsset(image)])),
+                source_root / "chapters/chapter_head.xml",
+            )
+            (source_root / "translation.xml").write_text(
+                "<translation><anchored><asset chapter_id='head' flow_index='9' "
+                "child_index='-1' state='translated'/></anchored></translation>",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid anchored asset"):
+                PDFCraftExtraction._from_workspace(source_root)._validate()
+
+
+class AsyncAnchoredContentTranslationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_facade_awaits_native_async_asset_transformer(self):
+        loop_thread = threading.get_ident()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source = make_extraction(source_root, page_pixel_sizes={1: (100, 100)})
+            image = SourceAsset(
+                1,
+                "image",
+                (1, 1, 20, 20),
+                title=["Title"],
+                content=["Content"],
+                caption=["Caption"],
+                asset_hash="e" * 64,
+            )
+            (source_root / "assets" / f"{image.asset_hash}.png").write_bytes(b"image")
+            save_xml(
+                encode(Chapter(None, -1, [StandaloneAsset(image)])),
+                source_root / "chapters/chapter_head.xml",
+            )
+            transformer = _AsyncAssetTranslator()
+
+            translated = await AsyncPDFCraft().translate_anchored_contents(
+                source,
+                root / "translated.pcex",
+                transformer,
+            )
+
+            self.assertEqual(transformer.thread_id, loop_thread)
+            with translated._materialize() as paths:
+                chapter = decode(parse(paths.chapters / "chapter_head.xml").getroot())
+            asset = chapter.flow_items[0]
+            assert isinstance(asset, StandaloneAsset)
+            self.assertEqual(asset.asset.content, ["Async content"])
+
+
+def _text(content) -> str:
+    return "".join(value for value in content if isinstance(value, str))
+
+
+if __name__ == "__main__":
+    unittest.main()

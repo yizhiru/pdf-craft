@@ -1,4 +1,7 @@
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncGenerator, Awaitable, Callable, Iterable, Iterator
+from contextlib import aclosing
+from dataclasses import dataclass
+from itertools import chain
 from typing import TypeVar
 from xml.etree.ElementTree import Element
 
@@ -6,8 +9,10 @@ from resource_segmentation import Group, Resource, Segment, split
 from tiktoken import Encoding
 
 from pdf_craft.transformer.xml_translator.segment import InlineSegment, TextSegment, search_inline_segments, search_text_segments
+from pdf_craft.runtime import invoke_callback
 from .callbacks import Callbacks
-from .concurrency import run_concurrency
+from .concurrency import run_async_parameters, run_concurrency_async
+from .source_store import source_identity, rebind, NODE_KEY, ROOT_KEY, unit_owner, unit_key
 from .score import ScoreSegment, expand_to_score_segments, truncate_score_segment
 
 _PAGE_INCISION = 0
@@ -18,7 +23,15 @@ _ResourcePayload = tuple[InlineSegment, list[ScoreSegment]]
 
 
 InlineSegmentMapping = tuple[Element, list[TextSegment]]
-InlineSegmentGroupMap = Callable[[list[InlineSegment]], list[InlineSegmentMapping | None]]
+AsyncInlineSegmentGroupMap = Callable[
+    [list[InlineSegment]], Awaitable[list[InlineSegmentMapping | None]]
+]
+
+
+@dataclass
+class _EmptyElement:
+    """A consumed root with no resources, not a model translation group."""
+    root: Element
 
 
 class XMLStreamMapper:
@@ -26,73 +39,134 @@ class XMLStreamMapper:
         self._encoding: Encoding = encoding
         self._max_group_score: int = max_group_score
 
-    def map_stream(
+    async def map_stream_async(
         self,
-        elements: Iterator[Element],
+        elements: Iterator[Element] | AsyncIterable[Element],
         callbacks: Callbacks,
-        map: InlineSegmentGroupMap,
-        concurrency: int,
-    ) -> Generator[tuple[Element, list[InlineSegmentMapping]], None, None]:
+        map: AsyncInlineSegmentGroupMap,
+        window: int,
+        on_mapping: Callable[[tuple[InlineSegment, list[TextSegment]]], object] | None = None,
+        track_progress: bool = False,
+        on_empty: Callable[[Element], object] | None = None,
+    ) -> AsyncGenerator[tuple[Element, list[InlineSegmentMapping]], None]:
         current_element: Element | None = None
         mapping_buffer: list[InlineSegmentMapping] = []
+        notifications = []
 
-        def execute(group: Group[_ResourcePayload]):
+        async def accepted(root, mappings):
+            rejected = {id(child) for node in root.iter() if node.get('__pdf_craft_missing') == '1'
+                        for child in node.iter()}
+            result = [(block, texts) for block, texts in mappings if id(block) not in rejected]
+            if on_mapping is not None:
+                for origin, texts, block in notifications:
+                    if id(block) not in rejected:
+                        await invoke_callback(on_mapping, (origin, texts))
+            notifications.clear()
+            return result
+
+
+        async def execute(group: Group[_ResourcePayload] | _EmptyElement):
+            if isinstance(group, _EmptyElement):
+                await invoke_callback(on_empty, group.root)
+                return ()
             head, body, tail = self._truncate_and_transform_group(group)
             head = [segment.clone() for segment in head]
             tail = [segment.clone() for segment in tail]
-            target_body = map(head + body + tail)[len(head) : len(head) + len(body)]
+            for segment in head + tail:
+                setattr(segment, "_translation_context", True)
+            target_body = (await map(head + body + tail))[len(head) : len(head) + len(body)]
             return zip(body, target_body, strict=False)
 
-        for mapping_pairs in run_concurrency(
-            parameters=self._split_into_serial_groups(elements, callbacks),
-            execute=execute,
-            concurrency=concurrency,
-        ):
-            for origin, target in mapping_pairs:
-                origin_element = origin.head.root
-                if current_element is None:
-                    current_element = origin_element
+        if isinstance(elements, AsyncIterable):
+            async def groups():
+                try:
+                    async for element in elements:
+                        yield_groups = self._split_into_serial_groups(
+                            (element,), callbacks, on_mapping is not None, track_progress, on_empty is not None,
+                        )
+                        for group in yield_groups:
+                            yield group
+                finally:
+                    close = getattr(elements, "aclose", None)
+                    if close is not None:
+                        await close()
+            results = run_async_parameters(groups(), execute, window, preserve_sources=False)
+        else:
+            results = run_concurrency_async(
+                self._split_into_serial_groups(elements, callbacks, on_mapping is not None, track_progress, on_empty is not None),
+                execute, window,
+            )
+        async with aclosing(results):
+            async for mapping_pairs in results:
+                for origin, target in mapping_pairs:
+                    origin_element = origin.head.root
+                    if current_element is None:
+                        current_element = origin_element
 
-                if id(current_element) != id(origin_element):
-                    yield current_element, mapping_buffer
-                    current_element = origin_element
-                    mapping_buffer = []
+                    if source_identity(current_element) != source_identity(origin_element):
+                        assert current_element is not None
+                        yield current_element, await accepted(current_element, mapping_buffer)
+                        current_element = origin_element
+                        mapping_buffer = []
 
-                if target:
-                    block_element, text_segments = target
-                    block_element = callbacks.interrupt_block_element(block_element)
-                    text_segments = list(callbacks.interrupt_translated_text_segments(text_segments))
-                    if text_segments:
-                        mapping_buffer.append((block_element, text_segments))
+                    owner = unit_owner(origin)
+                    if isinstance(elements, AsyncIterable):
+                        owner = rebind(current_element, origin, owner)
+                    assert owner is not None
+                    owner.set('__pdf_craft_unit', unit_key(owner))
+                    if target is None:
+                        owner.set('__pdf_craft_missing', '1')
+                    if target:
+                        assert current_element is not None
+                        block_element, text_segments = target
+                        if isinstance(elements, AsyncIterable):
+                            block_element = rebind(current_element, origin, block_element)
+                        if isinstance(elements, AsyncIterable):
+                            by_key = {node.get(NODE_KEY): node for node in current_element.iter() if node.get(NODE_KEY) is not None}
+                            for segment in text_segments:
+                                segment.parent_stack = [by_key.get(parent.get(NODE_KEY), parent) for parent in segment.parent_stack]
+                        assert block_element is not None
+                        block_element = callbacks.interrupt_block_element(block_element)
+                        text_segments = list(callbacks.interrupt_translated_text_segments(text_segments))
+                        if text_segments:
+                            if on_mapping is not None:
+                                notifications.append((origin, text_segments, block_element))
+                            mapping_buffer.append((block_element, text_segments))
 
         if current_element is not None:
-            yield current_element, mapping_buffer
+            yield current_element, await accepted(current_element, mapping_buffer)
 
-    def _split_into_serial_groups(self, elements: Iterable[Element], callbacks: Callbacks):
+    def _split_into_serial_groups(self, elements: Iterable[Element], callbacks: Callbacks,
+                                  track_origins: bool = False, track_progress: bool = False,
+                                  include_empty: bool = False):
         def generate():
             for element in elements:
+                resources = self._expand_to_resources(element, callbacks, track_origins, track_progress)
+                first = next(resources, None)
+                if first is None:
+                    if include_empty:
+                        yield _EmptyElement(element)
+                    continue
                 yield from split(
                     max_segment_count=self._max_group_score,
                     border_incision=_PAGE_INCISION,
-                    resources=self._expand_to_resources(element, callbacks),
+                    resources=chain((first,), resources),
                 )
 
-        generator = generate()
-        group = next(generator, None)
-        if group is None:
-            return
-
-        # head + body * N (without tail)
-        sum_count = group.head_remain_count + sum(x.count for x in self._expand_resource_segments(group.body))
-
-        while True:
-            next_group = next(generator, None)
-            if next_group is None:
-                break
-
+        group = None
+        sum_count = 0
+        for next_group in generate():
+            if isinstance(next_group, _EmptyElement):
+                # Empty roots need settlement but do not interrupt batching of
+                # the neighboring nonempty roots or introduce model requests.
+                yield next_group
+                continue
             next_sum_body_count = sum(x.count for x in self._expand_resource_segments(next_group.body))
+            if group is None:
+                group = next_group
+                sum_count = group.head_remain_count + next_sum_body_count
+                continue
             next_sum_count = sum_count + next_sum_body_count
-
             if next_sum_count + next_group.tail_remain_count > self._max_group_score:
                 yield group
                 group = next_group
@@ -102,8 +176,8 @@ class XMLStreamMapper:
                 group.tail = next_group.tail
                 group.tail_remain_count = next_group.tail_remain_count
                 sum_count = next_sum_count
-
-        yield group
+        if group is not None:
+            yield group
 
     def _truncate_and_transform_group(
         self, group: Group[_ResourcePayload]
@@ -125,11 +199,37 @@ class XMLStreamMapper:
             [r.payload[0] for r in tail],
         )
 
-    def _expand_to_resources(self, element: Element, callbacks: Callbacks):
+    def _expand_to_resources(self, element: Element, callbacks: Callbacks, track_origins: bool = False, track_progress: bool = False):
         def expand(element: Element):
-            text_segments = search_text_segments(element)
-            text_segments = callbacks.interrupt_source_text_segments(text_segments)
-            yield from search_inline_segments(text_segments)
+            # Weights belong to original blocks, before formula/context transport
+            # projection. Never count temporary tokens or prompt context.
+            from ...word_count import xml_block_word_counts
+            original_blocks = {}
+            if track_progress:
+                for block, words in xml_block_word_counts(element):
+                    original_blocks[id(block)] = original_blocks.get(id(block), 0) + words
+            def source_segments():
+                for text in search_text_segments(element, track_origins=track_origins):
+                    if track_progress:
+                        text.progress_blocks = (id(text.block_parent),)
+                    yield text
+            text_segments = callbacks.interrupt_source_text_segments(source_segments())
+            for inline in search_inline_segments(text_segments):
+                weight = 0
+                for text in inline:
+                    if text.progress_blocks:
+                        for identity in text.progress_blocks:
+                            weight += original_blocks.pop(identity, 0)
+                        continue
+                    if any(parent.tag in ('formula_context', 'translation-context') for parent in text.parent_stack):
+                        continue
+                    for parent in reversed(text.parent_stack):
+                        identity = id(parent)
+                        if identity in original_blocks:
+                            weight += original_blocks.pop(identity)
+                            break
+                inline._progress_words = weight  # pylint: disable=protected-access
+                yield inline
 
         inline_segment_generator = expand(element)
         start_incision = _PAGE_INCISION
@@ -147,6 +247,10 @@ class XMLStreamMapper:
             else:
                 end_incision = _PAGE_INCISION
 
+            for segment in inline_segment:
+                for parent in segment.parent_stack:
+                    if element.get(ROOT_KEY) is not None and parent.get(NODE_KEY) is None:
+                        parent.set(NODE_KEY, 'new-' + str(id(parent)))
             yield self._transform_to_resource(
                 inline_segment=inline_segment,
                 start_incision=start_incision,
@@ -155,6 +259,10 @@ class XMLStreamMapper:
             inline_segment = next_inline_segment
             start_incision = end_incision
 
+        for segment in inline_segment:
+            for parent in segment.parent_stack:
+                if element.get(ROOT_KEY) is not None and parent.get(NODE_KEY) is None:
+                    parent.set(NODE_KEY, 'new-' + str(id(parent)))
         yield self._transform_to_resource(
             inline_segment=inline_segment,
             start_incision=start_incision,

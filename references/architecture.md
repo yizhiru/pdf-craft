@@ -8,26 +8,68 @@
 
 `pdf_craft` 的主要业务模块围绕可组合的文档处理阶段组织：
 
-- `extractor/`：PDF 页面、OCR、目录和章节分析的适配入口；产出 Document Package。
-- `document/`：渲染就绪工件的路径契约和来源位置（页码、bbox、阅读顺序）。
-- `renderer/`：Document Package 到 Markdown 或 EPUB 的格式渲染入口。
+- `extractor/`：PDF 页面、OCR、目录和章节分析的适配入口；产出 PDFCraftExtraction。
+- `document/`：PDFCraftExtraction 的 workspace/`.pcex` 存储、校验和来源位置契约。
+- `renderer/`：PDFCraftExtraction 到 Markdown 或 EPUB 的格式渲染入口。
 - `transformer/`：格式无关的 XML 内容变换，包括 LLM 翻译、结构填充和校验。
 - `pipeline/`：格式专属编排。EPUB Pipeline 将 EPUB XHTML/目录/元数据交给 Transformer；PDF Pipeline 以 replace-only 方式将 Chapter 来源区域写回 PDF。
 
-提取后的渲染工件为 `chapters/`、`assets/`、`toc.xml` 和可选 `cover.png`。`ocr/`、`plots/` 与 `done` 仅是可丢弃的分析缓存。
+公开中间格式为 `PDFCraftExtraction`，持久化与交换载体必须是 `.pcex` ZIP。其内容为
+`manifest.json`、`pages.xml`、`chapters/`、`assets/`，以及可选 `toc.xml`、`cover.png`、
+`furnitures.xml` 和 v4 `translations/`。`translations/index.json` 按文件内唯一 ID 排列零到多个
+译文层；每层包含完整章节译文、metadata overlay、`coverage.xml`，以及可选 furniture 译文。
+目标语言只是层的元数据，同一种语言可以有多个 ID。根级 `translation.xml` 仍是旧式或内部物化
+译文视图的覆盖记录，不代表 v4 中可供渲染选择的持久化译文层。
 
-`pdf_craft/__init__.py` 是公共导入面。`pdf_craft/functions.py` 提供便利函数，负责创建 `Transform` 并转发到实例方法。`pdf_craft/transform.py` 是完整 Markdown 和 EPUB 转换的编排边界。
+PCEX 格式版本以已经发布的 Git tag 为兼容基线，不随开发期间的中间 commit 逐次递增。只有准备
+新版本且格式相对上一个已发布版本发生 schema 变化时，才评估是否增加 `format_version`。当前 v4
+相对 `v2.3.1` 的 v3 增加了可叠加 translation layer；读取器继续接受 v1/v2/v3。
+
+PCEX chapter 的阅读流使用 `FlowItem`：`TextFlowItem` 是作者意义的正文/标题段，包含保留
+来源 bbox 的 `SourceTextFragment`，并可在 fragment 之间嵌入图片/表格 `SourceAsset`。
+`DisplayFormula` 与 `StandaloneAsset` 是独立 flow node；段落公式不是 AnchoredContent，必须
+阻断段落拼接。类名与 chapter XML 元素一一对应，详见 `docs/*/PCEX_FORMAT.md`。
+Narrative 翻译仅把嵌在 `TextFlowItem` 中的图片/表格替换为无文本的临时 anchor，不能读取或覆写
+asset 文本；`StandaloneAsset` 不伪造 paragraph anchor，并与 NarrativeFlow 隔离；
+`AnchoredContentTransformer` 是另一条按 asset 小批次工作的翻译边界，负责 title/content/caption。
+目录-backed 形态只供一键转换在 `analysing_path/extraction/` 内部衔接前后端；普通目录不是
+公开输入。`ocr/`、`plots/`、`done` 和其他 analysis 文件仅是可丢弃的诊断/恢复缓存。
+
+`pdf_craft/__init__.py` 是公共导入面。`AsyncPDFCraft` 是业务核心，`PDFCraft` 是位于
+`pdf_craft/sync/` 的同步门面；`pdf_craft/transform.py` 是 PDF 前端
+提取 engine。Markdown、EPUB、翻译和 PDF 写回后端只能读取 PDFCraftExtraction，不得读取
+analysis/OCR 缓存。
+
+`PDFCraftExtraction` 是公开但不包含业务方法的 opaque handle。用户只能通过两个 Craft 门面的
+`open_extraction` / `export_extraction` 打开和导出，再把句柄传回门面或高级组件。高级可组合组件
+（Extractor、Renderer、Transformer、LLM runtime）仅提供无 `_async` 后缀的异步方法；同步适配
+不得进入业务核心。配置、选项、事件和数据类不拆分同步/异步版本。模型下载同样以 async 实现为准，
+同步使用通过 `PDFCraft.predownload_models()` 委派。
+
+业务执行以 async 为唯一真源：请求、重试、repair loop、编排和转换不能再提供第二套同步实现。
+`run_sync` 只能由 `pdf_craft/sync/` 的用户门面调用；禁止在实现层启动事件循环把同步业务伪装成
+异步业务。用户提供的 LLM、Transformer、TOC 转换、PDF handler 和图片 URL resolver 执行方法
+必须是异步契约，不提供同步扩展适配。普通事件通知可以接受同步或异步 callback。
+仅当第三方库没有异步接口时，才在独立执行域中调用同步适配器；适配器只承担第三方调用、
+文件读写和必要资源清理，不复制业务编排。跨域 callback 桥接不得成为另一条请求或转换路径。
+
+`translate_extraction()` 保留 source layer 并追加 replacement-only 译文层。Markdown/EPUB 渲染
+通过 `RenderMode.SOURCE`、`REPLACE`、`BILINGUAL` 决定只读原文、选择一份译文或合并原译文；
+`BILINGUAL_TEXT` 在同一来源 fragment 内追加译文。这些译文模式可显式传 translation ID，省略时稳定选择 index 第一项。PDF 写回也可显式选择译文层，
+但仅消费已有正文和 furniture 写回能力，不写回 anchored 图片/表格文字。
 
 除非任务明确要求破坏性 API 变更，否则把以下名称和默认值视为公共 API：
 
-- `transform_markdown`
-- `transform_epub`
+- `PDFCraft`、`AsyncPDFCraft`、`PDFOptions`、`ExtractionOptions`、`PDFCraftExtraction`
+- `PDFExtractor`、`MarkdownRenderer`、`EpubRenderer`
+- `ExtractionTransformer`、`NarrativeXMLTransformer`
+- `AnchoredContentExtractionTransformer`、`AnchoredContentTransformer`、`AnchoredContentXMLTransformer`
 - `predownload_models`
-- `Transform`
 - `LLM`
+- `JEV`、`FootnoteOptions`、`FootnoteRefinement`
 - `DeepSeekOCRLocalConfig`、`DeepSeekOCR2LocalConfig`、`UnlimitedOCRLocalConfig`
 - `DeepSeekOCRVendorConfig`、`DeepSeekOCR2VendorConfig`、`UnlimitedOCRVendorConfig`
-- `PDFHandler`、`PDFDocument`、`DefaultPDFHandler`、`DefaultPDFDocument`
+- `AsyncPDFHandler`、`AsyncPDFDocument`
 - `BookMeta`、`TableRender`、`LaTeXRender`
 
 ## 模块归属
@@ -47,3 +89,13 @@
 pdf-craft 对外只暴露自己的 OCR 配置对象，不暴露 `doc-page-extractor` 的 `PageExtractor`、`OCRAdapter` 或 factory 注入口。需要新增 OCR 后端时，优先在 `doc-page-extractor` 增加官方构造入口，再在 pdf-craft 映射成封闭配置对象。
 
 本包通过 `doc-page-extractor[local]` 获得上游本地 OCR 运行时栈，但不要把 `torch` 或 `torchvision` 作为 pdf-craft 的直接运行时依赖；用户仍可能需要按自己的环境覆盖安装 CPU 或 CUDA wheel。
+
+## PDF 后端边界
+
+只读页数、几何、元信息、文字和渲染统一由 Poppler 负责；出版标签通过 GLib 公开 API
+读取，标签树是否显式存在仅通过 pypdf 读取 catalog 判断，不扫描页面。该可选元数据读取
+沿用原有不可用时返回空标签的行为。pypdf 另用于 PDF 对象编辑/写入及独立编辑断言。
+`pdf/backend.py` 只传递嵌套操作的 Poppler 工具目录，不验证输入。转换流程没有自动完整性
+门禁；`assertions.py` 提供四个用户主动调用、成功 None/失败原异常的阻塞断言。
+EPUB 输入解析在 `pipeline/epub/adapter/`，断言与翻译共享章节读取器；epub-generator
+仅负责输出生成。

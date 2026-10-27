@@ -4,7 +4,10 @@ from xml.etree.ElementTree import Element
 
 from tiktoken import Encoding
 
-from pdf_craft.transformer.xml_translator.segment import BlockSegment, BlockSubmitter, TextSegment, search_text_segments
+from pdf_craft.transformer.xml_translator.segment import (
+    BlockImmutableElementsError, BlockSegment, BlockSubmitter, TextSegment,
+    search_text_segments,
+)
 from pdf_craft.transformer.xml_translator.xml import plain_text
 from .common import DATA_ORIGIN_LEN_KEY
 from .stream_mapper import InlineSegmentMapping
@@ -34,6 +37,11 @@ class HillClimbing:
     def request_element(self) -> Element:
         element = self._block_segment.create_element()
         for child_element in element:
+            # Immutable structural nodes (for example, Narrative asset
+            # anchors) are deliberately text-free.  They are protocol tokens,
+            # not score-bearing translation blocks.
+            if child_element.get("id") is None:
+                continue
             text = plain_text(child_element)
             tokens = self._encoding.encode(text)
             child_element.set(DATA_ORIGIN_LEN_KEY, str(len(tokens)))
@@ -55,6 +63,16 @@ class HillClimbing:
     def submit(self, element: Element) -> str | None:
         error_message, block_weights = self._validate_block_weights_and_error_message(element)
 
+        # Opaque structural tokens are not a partially useful translation.
+        # Do not let an invalid response become the hill-climbing baseline:
+        # its block text may otherwise survive a later repaired response with
+        # an equal score.
+        if error_message is not None and any(
+            isinstance(error, BlockImmutableElementsError)
+            for error in self._block_segment.validate(element)
+        ):
+            return error_message
+
         for submitter in self._block_segment.submit(element):
             weight: int = 0  # 未出现在 block_weights 说明没有错误，已完成
             if block_weights:
@@ -69,6 +87,19 @@ class HillClimbing:
                 status.weight = weight
                 status.submitter = submitter
 
+        return error_message
+
+    def validate(self, element: Element) -> str | None:
+        """Validate a candidate without admitting it to the hill-climbing state.
+
+        Some format-specific callers need to reject a structurally valid
+        response before it becomes the baseline for a block.  In particular,
+        PCEX's zero-width asset anchors must not let the fill model introduce
+        visible characters at a fragment boundary.  A rejected candidate must
+        not be retained: equally valid repaired responses otherwise cannot
+        replace it in the monotonic completion tracker.
+        """
+        error_message, _ = self._validate_block_weights_and_error_message(element)
         return error_message
 
     def _validate_block_weights_and_error_message(self, element: Element) -> tuple[str | None, dict[int, int] | None]:

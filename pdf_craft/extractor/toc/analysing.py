@@ -1,9 +1,15 @@
+# pylint: disable=unused-argument
+from pdf_craft.usage import UsageCollector
+from collections.abc import Mapping
+from pdf_craft.policies import RetryPolicy, ErrorPolicyInput
+from pdf_craft._policy import OMITTED, policy_operation
 import logging
 import re
 from pathlib import Path
 
 from ...common import XMLReader, read_xml, save_xml
 from ...llm import LLM
+from ...runtime import IO_DOMAIN
 from ...pdf import TITLE_TAGS, Page
 from ...pdf import decode as decode_pdf
 from .llm_analyser import (
@@ -22,45 +28,49 @@ logger = logging.getLogger(__name__)
 _TITLE_HEAD_REGX = re.compile(r"^\s*#{1,6}\s*")
 
 
-def analyse_toc(
+@policy_operation
+async def analyse_toc(
     pages_path: Path,
     toc_path: Path,
     toc_assumed: bool,
-    toc_llm: LLM | None = None,
+    toc_llm: LLM | None = None, *,
+    retry_policy: RetryPolicy | None = None, error_policy: ErrorPolicyInput = OMITTED,
+    request_headers: Mapping[str, str] | None = None,
+    usage: UsageCollector | None = None,
 ) -> TocInfo:
-    if toc_path.exists():
-        return decode_toc(read_xml(toc_path))
+    if await IO_DOMAIN.run(toc_path.exists):
+        return decode_toc(await IO_DOMAIN.run(read_xml, toc_path))
 
-    toc_path.parent.mkdir(parents=True, exist_ok=True)
-    toc_info = _do_analyse_toc(pages_path, toc_llm, toc_assumed)
-    save_xml(encode_toc(toc_info), toc_path)
+    await IO_DOMAIN.run(toc_path.parent.mkdir, parents=True, exist_ok=True)
+    toc_info = await _do_analyse_toc(pages_path, toc_llm, toc_assumed)
+    await IO_DOMAIN.run(save_xml, encode_toc(toc_info), toc_path)
 
     return toc_info
 
 
-def _do_analyse_toc(
+async def _do_analyse_toc(
     pages_path: Path,
     toc_llm: LLM | None,
     toc_assumed: bool,
 ) -> TocInfo:
-    pages: XMLReader[Page] = XMLReader(
+    pages: XMLReader[Page] = await IO_DOMAIN.run(XMLReader,
         prefix="page",
         dir_path=pages_path,
         decode=decode_pdf,
     )
     toc_pages: list[PageRef] = []
     if toc_assumed:
-        toc_pages = find_toc_pages(
+        toc_pages = await IO_DOMAIN.run(find_toc_pages,
             iter_titles=lambda: (
-                list(
+                (page.index, list(
                     (layout.order, _TITLE_HEAD_REGX.sub("", layout.text))
                     for layout in page.body_layouts
                     if layout.ref in TITLE_TAGS
-                )
+                ))
                 for page in pages.read()
             ),
             iter_page_bodies=lambda: (
-                "".join(layout.text for layout in page.body_layouts)
+                (page.index, "".join(layout.text for layout in page.body_layouts))
                 for page in pages.read()
             ),
         )
@@ -71,24 +81,26 @@ def _do_analyse_toc(
     if toc_pages:
         if toc_llm is not None:
             try:
-                ref2level = analyse_toc_levels_by_llm(
+                ref2level = await analyse_toc_levels_by_llm(
                     llm=toc_llm,
                     toc_page_refs=toc_pages,
-                    toc_page_contents=list(
+                    toc_page_contents=await IO_DOMAIN.run(lambda: list(
                         pages.read(
                             page_indexes={
                                 toc_page.page_index for toc_page in toc_pages
                             },
                         )
-                    ),
+                    )),
                 )
             except LLMAnalysisError as error:
-                print(
-                    f"LLM analysis toc failed, falling back to statistical method: {error}"
-                )
+                from ..._policy import recover
+                from ...policies import FailureCategory
+                from ..._failure_sources import ocr_locations
+                targets = await IO_DOMAIN.run(ocr_locations, pages_path)
+                await recover(error, FailureCategory.ANALYSIS, 'toc_analysis', 'statistical_analysis', targets=targets)
 
         if ref2level is None:
-            ref2level = analyse_toc_levels(
+            ref2level = await IO_DOMAIN.run(analyse_toc_levels,
                 pages=pages,
                 pages_path=pages_path,
                 toc_pages=toc_pages,
@@ -99,15 +111,21 @@ def _do_analyse_toc(
     else:
         if toc_llm is not None:
             try:
-                ref2level = analyse_title_levels_by_llm(toc_llm, pages)
+                ref2level = await analyse_title_levels_by_llm(toc_llm, pages)
             except LLMAnalysisError as error:
-                print(
-                    f"LLM analysis title failed, falling back to statistical method: {error}"
-                )
+                from ..._policy import recover
+                from ...policies import FailureCategory
+                from ..._failure_sources import ocr_locations
+                targets = await IO_DOMAIN.run(ocr_locations, pages_path)
+                await recover(error, FailureCategory.ANALYSIS, 'title_analysis', 'statistical_analysis', targets=targets)
 
         if ref2level is None:
-            ref2level = analyse_title_levels(pages)
+            ref2level = await IO_DOMAIN.run(analyse_title_levels, pages)
 
+    # A printed directory page is excluded from chapter content. It cannot
+    # also provide a chapter anchor, even if another directory page matched it.
+    excluded = set(toc_page_indexes)
+    ref2level = {key: level for key, level in ref2level.items() if key[0] not in excluded}
     return TocInfo(
         content=_structure_toc_by_levels(ref2level),
         page_indexes=toc_page_indexes,

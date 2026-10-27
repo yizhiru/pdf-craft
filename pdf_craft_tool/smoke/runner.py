@@ -1,9 +1,10 @@
+
+from pdf_craft import RetryPolicy
 import json
 import platform
 import shutil
 import traceback
 import zipfile
-from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -12,31 +13,33 @@ from time import perf_counter
 from typing import Any, Literal, cast
 
 from pdf_craft import (
-    ChapterPackageTransformer,
-    ChapterXMLTransformer,
+    ConcurrentExecutor,
     ExtractionOptions,
+    FootnoteOptions,
+    FixedCapacity,
     LLM,
     OCRConfig,
     OCRMode,
-    OCREvent,
+    ProgressEvent,
     PDFCraft,
     PDFOptions,
+    RenderMode,
     SubmitKind,
     XMLTranslator,
 )
-from pdf_craft.extractor.chapter.chapter import BlockLayout, BlockMember, Chapter, HTMLTag, ParagraphLayout
-
 from .assets import SmokeAsset, discover_assets
 from .checks import check_epub, check_markdown, check_package, check_pdf_patch_geometry
 from .ocr import create_ocr_config
+from .page_repair import run_page_repair_smoke
 from ..paths import DEFAULT_OUTPUT_ROOT, create_run_directory
 
 SmokeRoute = Literal[
     "package", "package-markdown", "package-epub", "markdown", "epub",
-    "pdf-patch", "epub-check", "epub-translate",
+    "pdf-patch", "epub-check", "epub-translate", "page-repair",
 ]
 PDF_ROUTES = {"package", "package-markdown", "package-epub", "markdown", "epub", "pdf-patch"}
 EPUB_ROUTES = {"epub-check", "epub-translate"}
+OCR_PAGE_ROUTES = {"page-repair"}
 
 
 @dataclass(frozen=True)
@@ -50,12 +53,14 @@ class SmokeRun:
     max_page_image_file_size: int | None = None
     max_ocr_tokens: int | None = None
     max_ocr_output_tokens: int | None = None
+    ocr_concurrency: int = 1
     includes_cover: bool = False
     includes_footnotes: bool = False
     generate_plot: bool = False
     toc_assumed: bool = False
     ocr: dict[str, Any] | None = None
     translation: dict[str, Any] | None = None
+    page_repair: dict[str, Any] | None = None
     configuration_error: str | None = None
 
 
@@ -91,16 +96,13 @@ class _ExecutionReport:
         self.stages.append({"stage": name, "started_at": now, "finished_at": now,
                             "elapsed_seconds": 0.0, "status": "skipped", "reason": reason})
 
-    def on_ocr_event(self, event: OCREvent) -> None:
-        payload: dict[str, Any] = {
-            "kind": event.kind.name.lower(), "page_index": event.page_index,
-            "total_pages": event.total_pages, "cost_time_ms": event.cost_time_ms,
-            "input_tokens": event.input_tokens, "output_tokens": event.output_tokens,
-        }
-        if event.error is not None:
-            payload["error_type"] = type(event.error).__name__
-            payload["error"] = self.redact_text(str(event.error))
-        self.ocr_events.append(payload)
+    def on_extraction_event(self, event: ProgressEvent) -> None:
+        self.ocr_events.append({
+            'kind': event.kind.name.lower(), 'unit_id': event.unit_id,
+            'unit_kind': event.unit_kind.name if event.unit_kind else None,
+            'page_index': event.page_index, 'stage': event.stage,
+            'outcome': event.outcome.name if event.outcome else None,
+        })
 
     def redact_text(self, text: str) -> str:
         for value in self.secret_values:
@@ -122,6 +124,8 @@ def expand_matrix(config: dict[str, Any], assets_root: Path) -> list[SmokeRun]:
             raise ValueError(f"PDF asset {asset} cannot use route {route}")
         if known[asset].format == "epub" and route not in EPUB_ROUTES:
             raise ValueError(f"EPUB asset {asset} cannot use route {route}")
+        if known[asset].format == "ocr-pages" and route not in OCR_PAGE_ROUTES:
+            raise ValueError(f"OCR page asset {asset} cannot use route {route}")
         pages = item.get("page_indexes")
         runs.append(SmokeRun(**(item | {"page_indexes": tuple(pages) if pages else None})))
     return runs
@@ -178,10 +182,17 @@ def run_smoke(
 
 def _execute(run: SmokeRun, asset: SmokeAsset, run_path: Path,
              report: _ExecutionReport) -> tuple[str, list[str], dict[str, Any]]:
+    if asset.format == "ocr-pages":
+        return run_page_repair_smoke(
+            asset.path,
+            run_path,
+            run.page_repair,
+            report,
+        )
     if asset.format == "epub":
         output = run_path / "output" / "book.epub"
         report.skipped("configure", "EPUB routes do not require OCR configuration")
-        report.skipped("extract", "EPUB routes do not extract a DocumentPackage")
+        report.skipped("extract", "EPUB routes do not extract a PDFCraftExtraction")
         if run.route == "epub-check":
             with report.stage("render"):
                 shutil.copy2(asset.path, output)
@@ -198,9 +209,10 @@ def _execute(run: SmokeRun, asset: SmokeAsset, run_path: Path,
             submit = SubmitKind[run.translation.get("submit", "REPLACE").upper()]
             PDFCraft().translate_epub(asset.path, output, target_language=run.translation.get("target_language", "zh"),
                                       submit=submit, user_prompt=run.translation.get("user_prompt"),
-                                      max_retries=run.translation.get("max_retries", 5),
+                                      retry_policy=RetryPolicy(**run.translation.get("retry_policy", {})),
                                       max_group_tokens=run.translation.get("max_group_tokens", 2600),
-                                      concurrency=run.translation.get("concurrency", 1),
+                                      window=run.translation.get("concurrency", 1),
+                                      executor=ConcurrentExecutor(FixedCapacity(int(run.translation.get("concurrency", 1)))),
                                       translation_llm=llm, fill_llm=fill_llm)
         with report.stage("check"):
             status, errors = _result_from_errors(check_epub(output))
@@ -221,31 +233,37 @@ def _run_pdf(
     run: SmokeRun, asset: SmokeAsset, run_path: Path, ocr: OCRConfig,
     report: _ExecutionReport | None = None,
 ) -> tuple[str, list[str], dict[str, Any]]:
-    package_path = run_path / "package"
+    extraction_path = run_path / "book.pcex"
     output_path = run_path / "output"
-    craft = PDFCraft(pdf=PDFOptions(ocr=ocr))
+    craft = PDFCraft(pdf=PDFOptions(
+        ocr=ocr,
+        ocr_executor=ConcurrentExecutor(FixedCapacity(run.ocr_concurrency)),
+    ))
     try:
         report = report or _ExecutionReport()
         with report.stage("extract"):
             package, metering = craft.extract_pdf_with_metering(
-                asset.path, package_path, ExtractionOptions(
+                asset.path, extraction_path, ExtractionOptions(
                     page_indexes=run.page_indexes, ocr_size=cast(Any, run.ocr_size), dpi=run.dpi,
                     max_page_image_file_size=run.max_page_image_file_size,
                     max_ocr_tokens=run.max_ocr_tokens,
                     max_ocr_output_tokens=run.max_ocr_output_tokens,
                     includes_cover=run.includes_cover,
-                    includes_footnotes=run.includes_footnotes,
+                    footnotes=(
+                        FootnoteOptions() if run.includes_footnotes else None
+                    ),
                 generate_plot=run.generate_plot, toc_assumed=run.toc_assumed,
-                on_ocr_event=report.on_ocr_event,
-                )
+                on_extraction_event=report.on_extraction_event,
+                ),
+                analysing_path=run_path / "analysis",
             )
     except Exception as error:
         unavailable = _unavailable_ocr_reason(error)
         if unavailable is not None:
-            return "skipped", [unavailable], {"package": str(package_path)}
+            return "skipped", [unavailable], {"package": str(extraction_path)}
         raise
     details = {
-        "package": str(package_path),
+        "package": str(extraction_path),
         "metering": {"input_tokens": metering.input_tokens, "output_tokens": metering.output_tokens},
     }
     if run.route == "package":
@@ -258,10 +276,14 @@ def _run_pdf(
         markdown = output_path / "book.md"
         markdown_assets = Path("assets")
         transformer = _package_translation(run, run_path)
+        mode, translation_id = _package_render_selection(run, transformer)
         with report.stage("render"):
             if transformer is not None:
-                package = _translate_package(craft, package, run_path, transformer)
-            craft.render_markdown(package, markdown, markdown_assets)
+                package = _translate_package(craft, package, run_path, transformer, run)
+            craft.render_markdown(
+                package, markdown, markdown_assets,
+                mode=mode, translation_id=translation_id,
+            )
         with report.stage("check"):
             errors = check_package(package)
             errors.extend(check_markdown(markdown))
@@ -274,10 +296,14 @@ def _run_pdf(
     if run.route in {"package-epub", "epub"}:
         epub = output_path / "book.epub"
         transformer = _package_translation(run, run_path)
+        mode, translation_id = _package_render_selection(run, transformer)
         with report.stage("render"):
             if transformer is not None:
-                package = _translate_package(craft, package, run_path, transformer)
-            craft.render_epub(package, epub)
+                package = _translate_package(craft, package, run_path, transformer, run)
+            craft.render_epub(
+                package, epub, label_language="en",
+                mode=mode, translation_id=translation_id,
+            )
         with report.stage("check"):
             errors = check_package(package)
             errors.extend(check_epub(epub))
@@ -299,8 +325,12 @@ def _run_pdf(
         ], details
     target = output_path / "book.pdf"
     with report.stage("render"):
-        transformer = translation_transformer if translation_transformer is not None else lambda text: prefix + text
-        craft.translate_pdf(asset.path, package, target, transformer)
+        translator = (
+            translation_transformer
+            if translation_transformer is not None
+            else _DeterministicXMLTranslator(str(prefix))
+        )
+        craft.translate_pdf(asset.path, package, target, cast(Any, translator))
     from .checks import check_pdf
     import pypdf
     with report.stage("check"):
@@ -334,56 +364,47 @@ def _epub_contains_marker(epub: Path, marker: str) -> bool:
         )
 
 
-class _DeterministicChapterTransformer:
+class _DeterministicXMLTranslator:
     def __init__(self, marker: str) -> None:
         self.marker = marker
-        self.mode = SubmitKind.REPLACE
+        self.target_language = "en"
 
-    def with_mode(self, mode: SubmitKind) -> "_DeterministicChapterTransformer":
-        transformer = _DeterministicChapterTransformer(self.marker)
-        transformer.mode = mode
-        return transformer
-
-    def transform(self, chapter: Chapter) -> Chapter:
-        for layout in chapter.layouts:
-            if not isinstance(layout, ParagraphLayout):
-                continue
-            transformed_blocks: list[BlockLayout] = []
-            for block in layout.blocks:
-                translated = BlockLayout(
-                    page_index=block.page_index,
-                    order=block.order,
-                    det=block.det,
-                    content=[self._transform_item(item) for item in deepcopy(block.content)],
-                )
-                if self.mode == SubmitKind.APPEND_BLOCK:
-                    transformed_blocks.extend((block, translated))
-                else:
-                    transformed_blocks.append(translated)
-            layout.blocks = transformed_blocks
-        return chapter
-
-    def _transform_item(self, item: str | BlockMember | HTMLTag[BlockMember]):
-        if isinstance(item, str):
-            return item + self.marker
-        if isinstance(item, HTMLTag):
-            item.children = [self._transform_item(child) for child in item.children]
-        return item
+    async def translate_element(self, task, **_kwargs):
+        for node in task.element.iter():
+            if node.text:
+                node.text += self.marker
+            if node.tail:
+                node.tail += self.marker
+        return task.element, task.payload
 
 
 def _package_translation(run: SmokeRun, run_path: Path):
     translation_transformer = _xml_translation_transformer(run, run_path)
     if translation_transformer is not None:
-        translation = run.translation or {}
-        mode = SubmitKind[translation.get("submit", "REPLACE").upper()]
-        return ChapterPackageTransformer(translation_transformer, mode=mode)
+        return translation_transformer
 
     translation = run.translation or {}
     marker = translation.get("package_marker")
     if not isinstance(marker, str):
         return None
-    mode = SubmitKind[translation.get("package_submit", "REPLACE").upper()]
-    return ChapterPackageTransformer(_DeterministicChapterTransformer(marker), mode=mode)
+    return _DeterministicXMLTranslator(marker)
+
+
+def _package_render_selection(
+    run: SmokeRun, transformer,
+) -> tuple[RenderMode, str | None]:
+    if transformer is None:
+        return RenderMode.SOURCE, None
+    translation = run.translation or {}
+    configured = translation.get("render_mode")
+    if configured is None:
+        submit = translation.get(
+            "package_submit", translation.get("submit", "REPLACE")
+        )
+        configured = "BILINGUAL" if str(submit).upper() == "APPEND_BLOCK" else "REPLACE"
+    mode = RenderMode(str(configured).lower())
+    translation_id = translation.get("translation_id")
+    return mode, translation_id if isinstance(translation_id, str) else None
 
 
 def _translate_package(
@@ -391,19 +412,19 @@ def _translate_package(
     package,
     run_path: Path,
     transformer,
+    run: SmokeRun,
 ):
-    """Run one smoke package translation through the public facade method."""
-    if not isinstance(transformer, ChapterPackageTransformer):
-        raise TypeError("smoke package routes require a ChapterPackageTransformer")
-    return craft.translate_package(
-        package,
-        run_path / "translated",
-        transformer.chapter_transformer,
-        submit=transformer.mode,
+    """Persist one PCEX translation layer before exercising renderer selection."""
+    translation = run.translation or {}
+    translation_id = translation.get("translation_id")
+    return craft.translate_extraction(
+        package, run_path / "translated.pcex", transformer,
+        translation_id=translation_id if isinstance(translation_id, str) else None,
+        target_language=str(translation.get("target_language", "en")),
     )
 
 
-def _xml_translation_transformer(run: SmokeRun, run_path: Path) -> ChapterXMLTransformer | None:
+def _xml_translation_transformer(run: SmokeRun, run_path: Path) -> XMLTranslator | None:
     translation = run.translation or {}
     llm_values = translation.get("llm")
     if not isinstance(llm_values, dict):
@@ -411,18 +432,18 @@ def _xml_translation_transformer(run: SmokeRun, run_path: Path) -> ChapterXMLTra
     translation_llm = LLM(**llm_values)
     fill_values = translation.get("fill_llm")
     fill_llm = LLM(**fill_values) if isinstance(fill_values, dict) else translation_llm
-    translator = XMLTranslator(
+    return XMLTranslator(
         translation_llm=translation_llm,
         fill_llm=fill_llm,
         target_language=translation.get("target_language", "zh"),
         user_prompt=translation.get("user_prompt"),
-        ignore_translated_error=False,
-        max_retries=translation.get("max_retries", 5),
+
+        retry_policy=RetryPolicy(**translation.get("retry_policy", {})),
         max_fill_displaying_errors=translation.get("max_fill_displaying_errors", 3),
         max_group_score=translation.get("max_group_tokens", 2600),
+        executor=ConcurrentExecutor(FixedCapacity(int(translation.get("concurrency", 1)))),
         cache_seed_content=f"pdf-craft-smoke:{run.asset}:{run.route}:{run.backend}:{run_path.name}",
     )
-    return ChapterXMLTransformer(cast(Any, translator), SubmitKind[translation.get("submit", "REPLACE").upper()])
 
 
 def _result_from_errors(errors: list[str]) -> tuple[str, list[str]]:
@@ -470,7 +491,7 @@ def _redact(value: Any) -> Any:
 def _is_secret_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     if normalized in {
-        "ak", "sk", "api_key", "apikey", "access_key", "secret_key", "password", "secret",
+        "ak", "sk", "key", "api_key", "apikey", "access_key", "secret_key", "password", "secret",
         "token", "api_token", "access_token", "refresh_token", "auth_token", "bearer_token",
     }:
         return True
@@ -496,4 +517,5 @@ def _secret_values(run: SmokeRun) -> list[str]:
 
     visit(run.ocr)
     visit(run.translation)
+    visit(run.page_repair)
     return sorted(set(values), key=len, reverse=True)

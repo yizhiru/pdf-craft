@@ -1,59 +1,67 @@
+
+from pdf_craft import ErrorPolicy
+# pylint: disable=protected-access
+
+import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from typing import cast
+from typing import Any, cast
 from xml.etree.ElementTree import tostring
 from PIL import Image
+from epub_generator import BookMeta
 
-from pdf_craft.document import DocumentPackage
+from pdf_craft import PDFCraft
 from pdf_craft.error import NoUsableOCRPagesError, OCRError
 from pdf_craft.extractor import PDFExtractor
 from pdf_craft.pipeline.pdf.pipeline import PDFTranslationPipeline
 from pdf_craft.pipeline.pdf import PDFPatcher
-from pdf_craft.transformer import (
-    ChapterPackageTransformer, ChapterXMLTransformer,
-    TranslationEvent, TranslationEventKind,
-)
+from pdf_craft.transformer import NarrativeXMLTransformer
+from pdf_craft.transformer.furniture_xml import FurnitureXMLTransformer
+from pdf_craft.transformer.package import ChapterExtractionTransformer, FurnitureExtractionTransformer
 from pdf_craft.renderer import EpubRenderer, MarkdownRenderer
-from pdf_craft.extractor.chapter.chapter import BlockLayout, Chapter, InlineExpression, ParagraphLayout, Reference, encode
-from pdf_craft.expression import ExpressionKind
+from pdf_craft.extractor.chapter.chapter import SourceAsset, SourceTextFragment, Chapter, TextFlowItem, encode
+from pdf_craft.common import save_xml
 from pdf_craft.ocr_config import DeepSeekOCRLocalConfig
 from pdf_craft.pdf.ocr import OCR, OCREvent, OCREventKind
 from pdf_craft.pdf.handler import PDFHandler
 from pdf_craft.pdf.types import Page
 from pdf_craft.transform import PDFExtractionEngine
+from tests.extraction_helpers import make_extraction
 
 
 class _FakeTransform:
-    def extract_package(self, *, analysing_path, **_kwargs):
-        (analysing_path / "chapters").mkdir(parents=True)
-        (analysing_path / "assets").mkdir()
-        (analysing_path / "toc.xml").write_text("<toc/>")
-        DocumentPackage.from_path(analysing_path).write_metadata(
-            dpi=300, page_pixel_sizes={1: (100, 100)}
+    async def extract_package_async(self, *, analysing_path, **_kwargs):
+        make_extraction(
+            analysing_path / "extraction", page_pixel_sizes={1: (100, 100)},
+            with_toc=True,
         )
         return None, None, None, None, "metering"
 
 
 class _NoAssetTransform:
-    def extract_package(self, *, analysing_path, **_kwargs):
-        (analysing_path / "chapters").mkdir(parents=True)
-        DocumentPackage.from_path(analysing_path).write_metadata(
-            dpi=300, page_pixel_sizes={1: (100, 100)}
-        )
+    async def extract_package_async(self, *, analysing_path, **_kwargs):
+        make_extraction(analysing_path / "extraction", page_pixel_sizes={1: (100, 100)})
         return None, None, None, None, "metering"
 
 
 class _CapturePatcher:
     def __init__(self):
         self.replacements = []
+        self.kwargs = {}
 
-    def patch(self, _source, _target, replacements):
+    async def patch(self, _source, _target, replacements, **kwargs):
         self.replacements = list(replacements)
+        self.kwargs = kwargs
 
 
 class _AllPagesFailOCR:
+    def metadata(self, *_args):
+        return None
+
+    is_vendor = False
     last_page_pixel_sizes: dict[int, tuple[int, int]] = {}
 
     def recognize(self, **_kwargs):
@@ -101,7 +109,7 @@ class _DeterministicXMLTranslator:
     def __init__(self):
         self.calls = 0
 
-    def translate_element(self, task, **_kwargs):
+    async def translate_element(self, task, **_kwargs):
         self.calls += 1
         for node in task.element.iter():
             if node.text:
@@ -112,16 +120,365 @@ class _DeterministicXMLTranslator:
 
 
 class TestComposableBoundaries(unittest.TestCase):
+    def test_pdf_patch_consumes_translation_created_by_public_facade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_extraction(
+                root / "source", page_pixel_sizes={1: (100, 100)},
+                book_meta=BookMeta(title="Source title", authors=["Source author"]),
+            )
+            save_xml(encode(Chapter(None, -1, [TextFlowItem(
+                "body", 0,
+                [SourceTextFragment(1, 1, (1, 1, 90, 30), ["source text"])],
+            )])), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns><pattern id='1' kind='universal'>"
+                "<position id='0'>Source footer</position></pattern></patterns><pages>"
+                "<page index='1'><section det='1,80,90,95'>"
+                "<association kind='universal' pattern_id='1' position_id='0'/>"
+                "</section></page></pages></furnitures>",
+                encoding="utf-8",
+            )
+
+            translated = PDFCraft().translate_extraction(
+                source,
+                root / "translated.pcex",
+                cast(Any, _DeterministicXMLTranslator()),
+                with_anchored=False,
+                with_furniture=True,
+                translation_id="translated-main",
+                target_language="en",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), translated,
+                translation_id="translated-main",
+            ))
+
+            self.assertEqual(
+                [item.text for item in capture.replacements],
+                ["T:Source footer", "T:source text"],
+            )
+            self.assertEqual(
+                capture.kwargs["document_metadata"]["/Title"], "T:Source title",
+            )
+            self.assertEqual(
+                capture.kwargs["document_metadata"]["/Author"], "Source author",
+            )
+
+    def test_pdf_patch_selects_a_stored_translation_by_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(
+                root / "source", page_pixel_sizes={1: (100, 100)},
+                book_meta=BookMeta(title="Source title", authors=["Source author"]),
+            )
+            source_chapter = Chapter(None, -1, [TextFlowItem(
+                "body", 0,
+                [SourceTextFragment(1, 1, (1, 1, 90, 30), ["source text"])],
+            )])
+            save_xml(encode(source_chapter), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns/><pages><page index='1'>"
+                "<section det='1,80,90,95'>Source footer</section>"
+                "</page></pages></furnitures>",
+                encoding="utf-8",
+            )
+            translations = root / "source/translations"
+            layer = translations / "translated-main"
+            (layer / "chapters").mkdir(parents=True)
+            translated_chapter = Chapter(None, -1, [TextFlowItem(
+                "body", 0,
+                [SourceTextFragment(1, 1, (1, 1, 90, 30), ["translated text"])],
+            )])
+            save_xml(encode(translated_chapter), layer / "chapters/chapter_head.xml")
+            (layer / "coverage.xml").write_text(
+                "<translation><narrative><paragraph chapter_id='head' page_index='1' "
+                "order='1' state='translated'/></narrative></translation>",
+                encoding="utf-8",
+            )
+            (layer / "metadata.json").write_text(
+                json.dumps({"title": "Translated title", "language": "en"}),
+                encoding="utf-8",
+            )
+            (translations / "index.json").write_text(json.dumps({"translations": [{
+                "id": "translated-main", "target_language": "en",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }]}), encoding="utf-8")
+            extraction._validate()
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+                translation_id="translated-main",
+            ))
+
+            self.assertEqual([item.text for item in capture.replacements], ["translated text"])
+            self.assertEqual(
+                [region.bbox for region in capture.replacements[0].obstacle_regions],
+                [(1, 80, 90, 95)],
+            )
+            self.assertEqual(
+                capture.kwargs["document_metadata"]["/Title"], "Translated title",
+            )
+            self.assertEqual(
+                capture.kwargs["document_metadata"]["/Author"], "Source author",
+            )
+
+            (layer / "furnitures.xml").write_text(
+                "<furnitures><patterns/><pages><page index='1'>"
+                "<section det='1,80,90,95'>Translated footer</section>"
+                "</page></pages></furnitures>",
+                encoding="utf-8",
+            )
+            (layer / "coverage.xml").write_text(
+                "<translation><narrative><paragraph chapter_id='head' page_index='1' "
+                "order='1' state='translated'/></narrative><furnitures>"
+                "<section page_index='1' det='1,80,90,95' state='translated'/>"
+                "</furnitures></translation>",
+                encoding="utf-8",
+            )
+            translated_furniture = _CapturePatcher()
+            asyncio.run(PDFTranslationPipeline(
+                patcher=cast(PDFPatcher, translated_furniture)
+            ).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+                translation_id="translated-main",
+            ))
+            self.assertEqual(
+                [item.text for item in translated_furniture.replacements],
+                ["Translated footer", "translated text"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "no translation with id"):
+                asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                    Path("input.pdf"), Path("output.pdf"), extraction,
+                    translation_id="missing-version",
+                ))
+            with self.assertRaisesRegex(ValueError, "translation_id"):
+                asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                    Path("input.pdf"), Path("output.pdf"), extraction,
+                    translation_id="bad/id",
+                ))
+
+    def test_pdf_patch_uses_only_translated_coverage_and_keeps_preserved_text_as_obstacle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "source", page_pixel_sizes={1: (100, 100)})
+            save_xml(encode(Chapter(None, -1, [
+                TextFlowItem("body", 0, [SourceTextFragment(1, 1, (1, 1, 90, 30), ["translated"])]),
+                TextFlowItem("body", 0, [SourceTextFragment(1, 2, (1, 40, 90, 70), ["preserved"])]),
+            ])), root / "source/chapters/chapter_head.xml")
+            (root / "source/translation.xml").write_text(
+                "<translation><narrative><paragraph chapter_id='head' page_index='1' order='1' state='translated'/>"
+                "</narrative></translation>", encoding="utf-8",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+            ))
+
+            self.assertEqual([replacement.text for replacement in capture.replacements], ["translated"])
+            self.assertEqual(
+                [region.bbox for region in capture.replacements[0].obstacle_regions], [(1, 40, 90, 70)],
+            )
+
+    def test_pdf_patch_keeps_one_covered_text_flow_continuous_across_asset_anchor(self):
+        """Coverage patching shares the same continuous-flow rule as translate()."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "source", page_pixel_sizes={1: (100, 100)})
+            save_xml(encode(Chapter(None, -1, [
+                TextFlowItem("body", 0, [
+                    SourceTextFragment(1, 1, (1, 1, 90, 20), ["translated before "]),
+                    SourceAsset(1, "image", (1, 22, 90, 70)),
+                    SourceTextFragment(1, 2, (1, 72, 90, 95), ["translated after"]),
+                ]),
+            ])), root / "source/chapters/chapter_head.xml")
+            (root / "source/translation.xml").write_text(
+                "<translation><narrative><paragraph chapter_id='head' page_index='1' order='1' state='translated'/>"
+                "</narrative></translation>", encoding="utf-8",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+            ))
+
+            self.assertEqual(len(capture.replacements), 1)
+            replacement = capture.replacements[0]
+            self.assertEqual(replacement.text, "translated before translated after")
+            self.assertEqual([region.bbox for region in replacement.regions], [
+                (1, 1, 90, 20), (1, 72, 90, 95),
+            ])
+            self.assertEqual(replacement.obstacle_regions, ())
+
+    def test_pdf_patch_places_translated_furniture_at_associated_and_standalone_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "source", page_pixel_sizes={1: (100, 100)})
+            save_xml(encode(Chapter(None, -1, [])), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns><pattern id='7' kind='universal'><position id='3'>Header</position>"
+                "</pattern></patterns><pages><page index='1'>"
+                "<section det='1,1,90,15'><association kind='universal' pattern_id='7' position_id='3'/></section>"
+                "<section det='1,80,90,95'>Footer</section>"
+                "</page></pages></furnitures>", encoding="utf-8",
+            )
+            (root / "source/translation.xml").write_text(
+                "<translation><furnitures><position pattern_id='7' position_id='3' state='translated'/>"
+                "<section page_index='1' det='1,80,90,95' state='translated'/></furnitures></translation>",
+                encoding="utf-8",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+            ))
+
+            self.assertEqual(
+                [(replacement.text, replacement.bbox) for replacement in capture.replacements], [
+                    ("Header", (1, 1, 90, 15)), ("Footer", (1, 80, 90, 95)),
+                ],
+            )
+
+    def test_furniture_translation_and_pdf_patch_rebuild_each_same_side_folio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(
+                root / "source", page_pixel_sizes={2: (100, 100), 4: (100, 100), 6: (100, 100)}
+            )
+            save_xml(encode(Chapter(None, -1, [])), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns><pattern id='7' kind='same_side'>"
+                "<position id='3' folio_style='D' folio_offset='0' folio_prefix='Page '/>"
+                "</pattern></patterns><pages>"
+                "<page index='2'><section det='1,1,90,15'><association kind='same_side' pattern_id='7' position_id='3'/></section></page>"
+                "<page index='4'><section det='1,1,90,15'><association kind='same_side' pattern_id='7' position_id='3'/></section></page>"
+                "<page index='6'><section det='1,1,90,15'><association kind='same_side' pattern_id='7' position_id='3'/></section></page>"
+                "</pages></furnitures>",
+                encoding="utf-8",
+            )
+            translated = asyncio.run(FurnitureExtractionTransformer(
+                FurnitureXMLTransformer(_DeterministicXMLTranslator())
+            ).transform(extraction, root / "translated.pcex"))
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), translated,
+            ))
+
+            self.assertEqual(
+                [(replacement.page_index, replacement.text) for replacement in capture.replacements],
+                [(2, "T:Page 2"), (4, "T:Page 4"), (6, "T:Page 6")],
+            )
+
+    def test_pdf_patch_orders_narrative_and_furniture_by_source_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "source", page_pixel_sizes={1: (100, 100), 2: (100, 100)})
+            save_xml(encode(Chapter(None, -1, [
+                TextFlowItem("body", 0, [SourceTextFragment(2, 1, (1, 1, 90, 30), ["Narrative"])]),
+            ])), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns><pattern id='7' kind='universal'><position id='3'>Header</position>"
+                "</pattern></patterns><pages><page index='1'>"
+                "<section det='1,1,90,15'><association kind='universal' pattern_id='7' position_id='3'/></section>"
+                "</page></pages></furnitures>", encoding="utf-8",
+            )
+            (root / "source/translation.xml").write_text(
+                "<translation><narrative><paragraph chapter_id='head' page_index='2' order='1' state='translated'/>"
+                "</narrative><furnitures><position pattern_id='7' position_id='3' state='translated'/>"
+                "</furnitures></translation>", encoding="utf-8",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+            ))
+
+            self.assertEqual(
+                [(replacement.page_index, replacement.layout_ref) for replacement in capture.replacements],
+                [(1, "furniture"), (2, "body")],
+            )
+
+    def test_pdf_patch_resolves_every_furniture_association_before_preserving(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "source", page_pixel_sizes={1: (100, 100)})
+            save_xml(encode(Chapter(None, -1, [])), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns>"
+                "<pattern id='7' kind='universal'><position id='3'>Old header</position></pattern>"
+                "<pattern id='8' kind='same_side'><position id='4'>Translated header</position></pattern>"
+                "</patterns><pages><page index='1'>"
+                "<section det='1,1,90,15'>"
+                "<association kind='universal' pattern_id='7' position_id='3'/>"
+                "<association kind='same_side' pattern_id='8' position_id='4'/>"
+                "</section></page></pages></furnitures>",
+                encoding="utf-8",
+            )
+            (root / "source/translation.xml").write_text(
+                "<translation><furnitures>"
+                "<position pattern_id='7' position_id='3' state='preserved'/>"
+                "<position pattern_id='8' position_id='4' state='translated'/>"
+                "</furnitures></translation>",
+                encoding="utf-8",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+            ))
+
+            self.assertEqual(
+                [(replacement.text, replacement.bbox) for replacement in capture.replacements],
+                [("Translated header", (1, 1, 90, 15))],
+            )
+
+    def test_pdf_patch_preserves_conflicting_translated_furniture_associations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extraction = make_extraction(root / "source", page_pixel_sizes={1: (100, 100)})
+            save_xml(encode(Chapter(None, -1, [])), root / "source/chapters/chapter_head.xml")
+            (root / "source/furnitures.xml").write_text(
+                "<furnitures><patterns>"
+                "<pattern id='7' kind='universal'><position id='3'>First</position></pattern>"
+                "<pattern id='8' kind='same_side'><position id='4'>Second</position></pattern>"
+                "</patterns><pages><page index='1'><section det='1,1,90,15'>"
+                "<association kind='universal' pattern_id='7' position_id='3'/>"
+                "<association kind='same_side' pattern_id='8' position_id='4'/>"
+                "</section></page></pages></furnitures>",
+                encoding="utf-8",
+            )
+            (root / "source/translation.xml").write_text(
+                "<translation><furnitures>"
+                "<position pattern_id='7' position_id='3' state='translated'/>"
+                "<position pattern_id='8' position_id='4' state='translated'/>"
+                "</furnitures></translation>",
+                encoding="utf-8",
+            )
+            capture = _CapturePatcher()
+
+            asyncio.run(PDFTranslationPipeline(patcher=cast(PDFPatcher, capture)).patch(
+                Path("input.pdf"), Path("output.pdf"), extraction,
+            ))
+
+            self.assertEqual(capture.replacements, [])
+
     def test_extraction_rejects_all_pages_ignored_after_ocr_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             engine = object.__new__(PDFExtractionEngine)
             setattr(engine, "_ocr", cast(OCR, _AllPagesFailOCR()))
+            setattr(engine, "_ocr_executor", None)
 
             with patch("pdf_craft.transform.analyse_toc") as analyse_toc, self.assertRaisesRegex(
                 NoUsableOCRPagesError, "no usable pages"
             ) as raised:
-                engine.extract_package(
+                asyncio.run(engine.extract_package_async(
                     pdf_path=root / "input.pdf",
                     analysing_path=root / "package",
                     ocr_size="gundam",
@@ -129,8 +486,8 @@ class TestComposableBoundaries(unittest.TestCase):
                     max_page_image_file_size=None,
                     includes_cover=False,
                     includes_footnotes=False,
-                    ignore_pdf_errors=False,
-                    ignore_ocr_errors=True,
+                    error_policy=ErrorPolicy(ignore_pdf_render_errors=False, ignore_ocr_errors=True),
+
                     generate_plot=False,
                     toc_llm=None,
                     toc_assumed=False,
@@ -138,149 +495,131 @@ class TestComposableBoundaries(unittest.TestCase):
                     max_tokens=None,
                     max_output_tokens=None,
                     on_ocr_event=lambda _: None,
-                )
+                ))
 
             self.assertEqual(raised.exception.failed_page_indexes, (1, 2))
             analyse_toc.assert_not_called()
 
-    def test_package_translation_skips_empty_chapters(self):
+    def test_extraction_translation_skips_empty_chapters(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = DocumentPackage.from_path(root / "source")
-            source.chapters_path.mkdir(parents=True)
-            source.assets_path.mkdir()
-            source.write_metadata(page_pixel_sizes={1: (100, 100)})
+            source_root = root / "source"
+            source = make_extraction(source_root, page_pixel_sizes={1: (100, 100)})
             empty = Chapter(None, 0, [])
-            text = Chapter(None, 0, [ParagraphLayout(
-                "text", 0, [BlockLayout(1, 1, (1, 1, 50, 50), ["text"])]
+            text = Chapter(1, 0, [TextFlowItem(
+                "body", 0, [SourceTextFragment(1, 1, (1, 1, 50, 50), ["text"])]
             )])
-            (source.chapters_path / "chapter_1.xml").write_text(
+            (source_root / "chapters/chapter_head.xml").write_text(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 + tostring(encode(empty), encoding="unicode")
             )
-            (source.chapters_path / "chapter_2.xml").write_text(
+            (source_root / "chapters/chapter_1.xml").write_text(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 + tostring(encode(text), encoding="unicode")
             )
 
             translator = _DeterministicXMLTranslator()
-            target = ChapterPackageTransformer(
-                ChapterXMLTransformer(translator)
-            ).transform(source, root / "target")
+            target = asyncio.run(ChapterExtractionTransformer(
+                NarrativeXMLTransformer(translator)
+            ).transform(source, root / "target.pcex"))
 
             self.assertEqual(translator.calls, 1)
-            self.assertEqual(
-                (target.chapters_path / "chapter_1.xml").read_text(),
-                (source.chapters_path / "chapter_1.xml").read_text(),
-            )
-            self.assertIn("T:text", (target.chapters_path / "chapter_2.xml").read_text())
+            with target._materialize() as paths:
+                self.assertEqual(
+                    (paths.chapters / "chapter_head.xml").read_text(),
+                    (source_root / "chapters/chapter_head.xml").read_text(),
+                )
+                self.assertIn("T:text", (paths.chapters / "chapter_1.xml").read_text())
 
     def test_extractor_creates_empty_assets_directory_for_asset_free_pages(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package, _ = PDFExtractor(_NoAssetTransform()).extract_with_metering(
-                root / "input.pdf", root / "package"
+            extraction, _ = asyncio.run(
+                PDFExtractor(_NoAssetTransform()).extract_with_metering(
+                    root / "input.pdf", root / "book.pcex"
+                )
             )
-            self.assertTrue(package.assets_path.is_dir())
+            with extraction._materialize() as paths:
+                self.assertTrue(paths.assets.is_dir())
 
-    def test_extractor_produces_package_consumed_by_renderers_without_ocr_cache(self):
+    def test_extractor_produces_extraction_consumed_without_analysis_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package, metering = PDFExtractor(_FakeTransform()).extract_with_metering(root / "input.pdf", root / "package")
+            extraction, metering = asyncio.run(
+                PDFExtractor(_FakeTransform()).extract_with_metering(
+                    root / "input.pdf", root / "book.pcex",
+                    analysing_path=root / "analysis",
+                )
+            )
             self.assertEqual(metering, "metering")
-            self.assertFalse((root / "package" / "ocr").exists())
-            self.assertIsNone(package.cover_path)
-            self.assertEqual(package.page_pixel_sizes(), {1: (100, 100)})
-            with patch("pdf_craft.renderer.markdown.renderer.render_markdown_file") as markdown:
-                MarkdownRenderer().render(package, root / "book.md")
-            self.assertEqual(markdown.call_args.args[0], package.chapters_path)
-            with patch("pdf_craft.renderer.epub.renderer.render_epub_file") as epub:
-                EpubRenderer().render(package, root / "book.epub")
-            self.assertEqual(epub.call_args.args[0], package.chapters_path)
+            self.assertFalse((root / "analysis" / "extraction" / "ocr").exists())
+            self.assertEqual(extraction._page_pixel_sizes(), {1: (100, 100)})
+            asyncio.run(MarkdownRenderer().render(extraction, root / 'book.md'))
+            asyncio.run(EpubRenderer().render(extraction, root / 'book.epub'))
+            self.assertTrue((root / 'book.md').is_file())
+            self.assertTrue((root / 'book.epub').is_file())
 
-    def test_pdf_pipeline_preserves_structured_content_and_uses_package_metadata(self):
+    def test_explicit_epub_book_meta_overrides_only_its_nonempty_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = DocumentPackage.from_path(root)
-            package.chapters_path.mkdir(parents=True)
-            package.assets_path.mkdir()
-            package.write_metadata(dpi=300, page_pixel_sizes={1: (100, 100)})
-            reference = Reference(1, 2, "[1]", [])
-            chapter = Chapter(None, -1, [
-                ParagraphLayout("text", 0, [BlockLayout(
-                    1, 1, (1, 1, 50, 50), ["text ", InlineExpression(ExpressionKind.INLINE_DOLLAR, "x"), reference]
-                )]),
-                ParagraphLayout("sub_title", 1, [BlockLayout(1, 2, (1, 50, 50, 90), ["heading"])]),
-            ])
-            patcher = _CapturePatcher()
-            with patch("pdf_craft.pipeline.pdf.pipeline.create_chapters_reader", return_value=lambda: iter([chapter])):
-                PDFTranslationPipeline(patcher=cast(PDFPatcher, patcher)).translate(
-                    root / "input.pdf", root / "out.pdf", package,
-                    ChapterXMLTransformer(_DeterministicXMLTranslator())
-                )
-            self.assertEqual(len(patcher.replacements), 2)
-            replacement = patcher.replacements[0]
-            self.assertEqual(replacement.page_pixel_size, (100, 100))
-            self.assertIn("$T:x$", replacement.text)
-            self.assertIn("[1]", replacement.text)
-            self.assertIn("T:heading", patcher.replacements[1].text)
-
-    def test_pdf_pipeline_forwards_translation_events_to_structured_transformer(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            package = DocumentPackage.from_path(root)
-            package.chapters_path.mkdir(parents=True)
-            package.assets_path.mkdir()
-            package.write_metadata(page_pixel_sizes={1: (100, 100)})
-            chapter = Chapter(None, -1, [ParagraphLayout(
-                "text", 0, [BlockLayout(1, 1, (1, 1, 50, 50), ["text"])]
-            )])
-            observed = []
-            forwarded = []
-
-            class EventTranslator:
-                def translate_element(self, task, **kwargs):
-                    forwarded.append(kwargs["on_translation_event"])
-                    event = TranslationEvent(
-                        kind=TranslationEventKind.PROGRESS,
-                        completed_characters=4,
-                        total_characters=4,
-                    )
-                    kwargs["on_translation_event"](event)
-                    return task.element, task.payload
-
-            callback = observed.append
-            with patch("pdf_craft.pipeline.pdf.pipeline.create_chapters_reader", return_value=lambda: iter([chapter])):
-                PDFTranslationPipeline(patcher=cast(PDFPatcher, _CapturePatcher())).translate(
-                    root / "input.pdf", root / "out.pdf", package,
-                    ChapterXMLTransformer(EventTranslator()),
-                    on_translation_event=callback,
-                )
-
-            self.assertEqual(forwarded, [callback])
-            self.assertGreaterEqual(len(observed), 3)
-            self.assertIn(
-                TranslationEventKind.PROGRESS,
-                [event.kind for event in observed],
+            extraction = make_extraction(
+                root,
+                page_pixel_sizes={1: (100, 100)},
+                with_toc=True,
+                book_meta=BookMeta(
+                    title="OCR title",
+                    description="OCR description",
+                    publisher="OCR press",
+                    isbn="978-1-4028-9462-6",
+                    authors=["OCR author"],
+                    editors=["OCR editor"],
+                    translators=["OCR translator"],
+                ),
+                language="en",
             )
+            async def epub_output(*args, **_kwargs):
+                args[5].write_bytes(b"rendered")
+            with patch("pdf_craft.renderer.epub.content.render_content", side_effect=epub_output) as epub:
+                asyncio.run(EpubRenderer().render(
+                    extraction,
+                    root / "book.epub",
+                    book_meta=BookMeta(title="Manual title", description=""),
+                ))
 
-    def test_metadata_path_is_retained_for_direct_package(self):
+            metadata = epub.call_args.kwargs["book_meta"]
+            self.assertEqual(metadata.title, "Manual title")
+            self.assertEqual(metadata.description, "OCR description")
+            self.assertEqual(metadata.publisher, "OCR press")
+            self.assertEqual(metadata.isbn, "978-1-4028-9462-6")
+            self.assertEqual(metadata.authors, ["OCR author"])
+            self.assertEqual(metadata.editors, ["OCR editor"])
+            self.assertEqual(metadata.translators, ["OCR translator"])
+
+    def test_pdf_pipeline_never_recovers_missing_geometry_from_source_pdf(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = DocumentPackage(root / "chapters", root / "assets")
-            package.write_metadata(dpi=300, page_pixel_sizes={1: (30, 30)})
-            self.assertEqual(package.page_pixel_sizes(), {1: (30, 30)})
+            extraction = make_extraction(root, page_pixel_sizes={1: (100, 100)})
+            chapter = Chapter(None, -1, [TextFlowItem(
+                "body", 0, [SourceTextFragment(2, 1, (1, 1, 50, 50), ["text"])]
+            )])
+            handler = _FakeHandler()
+            patcher = _CapturePatcher()
+            with patch(
+                "pdf_craft.pipeline.pdf.pipeline.create_chapters_reader",
+                return_value=lambda: iter([chapter]),
+            ), self.assertRaisesRegex(ValueError, "pages.xml is missing page 2"):
+                asyncio.run(PDFTranslationPipeline(
+                    _native_pdf_handler=cast(PDFHandler, handler),
+                    patcher=cast(PDFPatcher, patcher),
+                ).patch(root / "input.pdf", root / "out.pdf", extraction))
+            self.assertEqual(handler.document.render_count, 0)
+            self.assertEqual(patcher.replacements, [])
 
-    def test_epub_renderer_rejects_unsupported_language(self):
+    def test_pages_xml_is_used_for_direct_workspace_extraction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = DocumentPackage.from_path(root)
-            package.chapters_path.mkdir()
-            package.assets_path.mkdir()
-            assert package.toc_path is not None
-            package.toc_path.write_text("<toc/>")
-            with self.assertRaises(ValueError):
-                EpubRenderer().render(package, root / "book.epub", lan="fr")  # type: ignore[arg-type]
+            extraction = make_extraction(root, page_pixel_sizes={1: (30, 30)})
+            self.assertEqual(extraction._page_pixel_sizes(), {1: (30, 30)})
 
     def test_ocr_geometry_cache_survives_interrupted_resume_without_rerendering(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -310,9 +649,11 @@ class TestComposableBoundaries(unittest.TestCase):
             with patch(
                 "pdf_craft.pdf.ocr.PageExtractorNode.image2page", side_effect=error
             ):
-                events = list(first.recognize(
-                    root / "input.pdf", root / "assets", root / "ocr", ignore_ocr_errors=True
-                ))
+                events = []
+                with self.assertRaises(NoUsableOCRPagesError):
+                    for event in first.recognize(root / 'input.pdf', root / 'assets', root / 'ocr',
+                                                 error_policy=ErrorPolicy(ignore_ocr_errors=True)):
+                        events.append(event)
             self.assertEqual(events[-1].kind, OCREventKind.FAILED)
             self.assertTrue((root / "ocr" / "page_1.failed").exists())
             self.assertFalse((root / "ocr" / "done").exists())
@@ -321,25 +662,28 @@ class TestComposableBoundaries(unittest.TestCase):
             resumed = OCR(DeepSeekOCRLocalConfig(local_only=True), cast(PDFHandler, handler))
             with patch("pdf_craft.pdf.ocr.PageExtractorNode.image2page", return_value=page):
                 events = list(resumed.recognize(
-                    root / "input.pdf", root / "assets", root / "ocr", ignore_ocr_errors=True
+                    root / "input.pdf", root / "assets", root / "ocr", error_policy=ErrorPolicy(ignore_ocr_errors=True)
                 ))
             self.assertEqual(events[-1].kind, OCREventKind.COMPLETE)
             self.assertFalse((root / "ocr" / "page_1.failed").exists())
             self.assertTrue((root / "ocr" / "done").exists())
 
-    def test_package_rejects_malformed_page_geometry(self):
+    def test_extraction_rejects_malformed_page_geometry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = DocumentPackage.from_path(root)
-            package.chapters_path.mkdir()
-            package.assets_path.mkdir()
-            assert package.metadata_path is not None
-            package.metadata_path.write_text('{"schema": 1, "page_pixel_sizes": {"1": [1]}}')
-            with self.assertRaisesRegex(ValueError, "page_pixel_sizes"):
-                package.validate()
-            package.metadata_path.write_text('{"schema": 1, "page_pixel_sizes": {"1": [1.5, 2]}}')
-            with self.assertRaisesRegex(ValueError, "page_pixel_sizes"):
-                package.validate()
+            extraction = make_extraction(root)
+            (root / "pages.xml").write_text(
+                '<pages index_base="1" coordinate_space="ocr_pixels" render_dpi="300">'
+                '<page index="1" width="1" /></pages>'
+            )
+            with self.assertRaisesRegex(ValueError, "pages.xml"):
+                extraction._validate()
+            (root / "pages.xml").write_text(
+                '<pages index_base="1" coordinate_space="ocr_pixels" render_dpi="300">'
+                '<page index="1" width="1.5" height="2" /></pages>'
+            )
+            with self.assertRaisesRegex(ValueError, "pages.xml"):
+                extraction._validate()
 
     def test_ocr_rejects_malformed_geometry_cache(self):
         with tempfile.TemporaryDirectory() as directory:

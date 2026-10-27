@@ -1,52 +1,182 @@
-from collections import deque
-from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TypeVar
+"""Ordered delivery with bounded execution and disk-backed reorder storage."""
+
+import asyncio
+import pickle
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Iterable
+from pathlib import Path
+from typing import Any, TypeVar
+from xml.etree.ElementTree import Element
+
+from pdf_craft.concurrency import NonContinuableError, fatal_error_boundary, settle_tasks
+from pdf_craft.runtime import IO_DOMAIN, temporary_directory
 
 P = TypeVar("P")
 R = TypeVar("R")
 
 
-def run_concurrency(
-    parameters: Iterable[P],
-    execute: Callable[[P], R],
-    concurrency: int,
-) -> Iterable[R]:
-    assert concurrency >= 1, "the concurrency must be at least 1"
-    # Fast path: concurrency == 1, no thread overhead
-    if concurrency == 1:
-        for param in parameters:
-            yield execute(param)
-        return
+def _source_elements(value, found=None, visited=None):
+    """Keep source DOM identity; translated payloads themselves go to disk."""
+    found = {} if found is None else found
+    visited = set() if visited is None else visited
+    if id(value) in visited:
+        return found
+    visited.add(id(value))
+    if isinstance(value, Element):
+        found[id(value)] = value
+    elif isinstance(value, dict):
+        for child in value.values():
+            _source_elements(child, found, visited)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _source_elements(child, found, visited)
+    elif hasattr(value, "__dict__") and not isinstance(value, type):
+        _source_elements(vars(value), found, visited)
+    return found
 
-    executor = ThreadPoolExecutor(max_workers=concurrency)
-    did_shutdown = False
+
+def _save(path, value, sources):
+    references = {}
+
+    class Writer(pickle.Pickler):
+        def persistent_id(self, obj):
+            if isinstance(obj, Element) and id(obj) in sources:
+                references[id(obj)] = obj
+                return id(obj)
+            return None
+
+    with path.open("wb") as file:
+        Writer(file, protocol=pickle.HIGHEST_PROTOCOL).dump(value)
+    return references
+
+
+def _load(path, references):
+    class Reader(pickle.Unpickler):
+        def persistent_load(self, pid):
+            return references[pid]
+
+    with path.open("rb") as file:
+        value = Reader(file).load()
+    path.unlink()
+    return value
+
+
+async def run_concurrency_async(
+    parameters: Iterable[P], execute: Callable[[P], Awaitable[R]], concurrency: int,
+) -> AsyncGenerator[R, None]:
+    """Adapt synchronous input to the one asynchronous scheduler."""
+    results = run_async_parameters(parameters, execute, concurrency)
     try:
-        futures: deque[Future[R]] = deque()
-        params_iter = iter(parameters)
-        for _ in range(concurrency):
-            try:
-                param = next(params_iter)
-                future = executor.submit(execute, param)
-                futures.append(future)
-            except StopIteration:
-                break
-
-        while futures:
-            future = futures.popleft()
-            yield future.result()
-            try:
-                param = next(params_iter)
-                new_future = executor.submit(execute, param)
-                futures.append(new_future)
-            except StopIteration:
-                pass
-
-    except KeyboardInterrupt:
-        executor.shutdown(wait=False, cancel_futures=True)
-        did_shutdown = True
-        raise
-
+        async for result in results:
+            yield result
     finally:
-        if not did_shutdown:
-            executor.shutdown(wait=True)
+        await results.aclose()
+
+
+@fatal_error_boundary
+async def run_async_parameters(parameters, execute, concurrency, *, preserve_sources=True):
+    """Slow ordered output never prevents admission to an idle execution slot.
+
+    Completed content is pickled and loaded at its input-order position.
+    Legacy callers can retain original node identities; detached async XML
+    adapters disable that retention and recover source contexts from disk.
+    """
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+    execute = fatal_error_boundary(execute)
+    asynchronous = isinstance(parameters, AsyncIterable)
+    iterator: Any = aiter(parameters) if asynchronous else iter(parameters)
+    ready = {}
+    changed = asyncio.Event()
+    async with temporary_directory("pdf-craft-reorder-") as directory:
+        root = Path(directory)
+
+        async def produce():
+            pending = {}
+            incoming = None
+            next_input = 0
+            exhausted = False
+            try:
+                while not exhausted or pending or incoming is not None:
+                    if not asynchronous:
+                        while not exhausted and len(pending) < concurrency:
+                            try:
+                                parameter = next(iterator)
+                            except StopIteration:
+                                exhausted = True
+                                break
+                            task = asyncio.create_task(execute(parameter))
+                            pending[task] = (next_input, _source_elements(parameter) if preserve_sources else {})
+                            next_input += 1
+                    elif not exhausted and incoming is None and len(pending) < concurrency:
+                        incoming = asyncio.ensure_future(anext(iterator))
+                    waiting = set(pending)
+                    if incoming is not None:
+                        waiting.add(incoming)
+                    if not waiting:
+                        break
+                    done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                    failures = [task.exception() for task in done
+                                if task in pending and not task.cancelled() and task.exception() is not None]
+                    if failures:
+                        raise next((error for error in failures
+                                    if isinstance(error, NonContinuableError)), failures[0])
+                    if incoming is not None and incoming in done:
+                        try:
+                            parameter = incoming.result()
+                        except StopAsyncIteration:
+                            exhausted = True
+                        else:
+                            sources = _source_elements(parameter) if preserve_sources else {}
+                            task = asyncio.create_task(execute(parameter))
+                            pending[task] = (next_input, sources)
+                            next_input += 1
+                        incoming = None
+                    for task in done:
+                        if task not in pending:
+                            continue
+                        index, sources = pending.pop(task)
+                        references = await IO_DOMAIN.run(_save, root / str(index), task.result(), sources)
+                        ready[index] = references
+                        changed.set()
+            finally:
+                try:
+                    tasks = list(pending)
+                    if incoming is not None:
+                        tasks.append(incoming)
+                    for task in tasks:
+                        task.cancel()
+                    try:
+                        await settle_tasks(tasks)
+                    finally:
+                        if asynchronous:
+                            close = getattr(iterator, "aclose", None)
+                            if close is not None:
+                                await close()
+                        else:
+                            close = getattr(iterator, "close", None)
+                            if close is not None:
+                                close()
+                finally:
+                    # The consumer may still be blocked on changed.wait().
+                    # Cleanup failures must wake it too, so it can observe the
+                    # producer's exit and propagate the recorded terminal cause.
+                    changed.set()
+
+        producer = asyncio.create_task(produce())
+        index = 0
+        try:
+            while True:
+                changed.clear()
+                if producer.done():
+                    producer.result()
+                if index in ready:
+                    references = ready.pop(index)
+                    yield await IO_DOMAIN.run(_load, root / str(index), references)
+                    index += 1
+                elif producer.done():
+                    return
+                else:
+                    await changed.wait()
+        finally:
+            producer.cancel()
+            await settle_tasks([producer])

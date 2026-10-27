@@ -31,12 +31,15 @@ CUDA 环境安装匹配的 PyTorch。没有可用 CUDA 设备时，使用标准�
 ## 系统要求
 
 - Python `>=3.11,<3.14`。
-- Poppler：PDF 页面渲染、OCR 提取以及公开的 PDF patch/translation 流程默认需要它，
-  因为这些流程会渲染页面来生成或合成内容。
-- 只有纯粹使用 pypdf 读取并写回 PDF 的自定义流程才不需要 Poppler；这不是
-  `PDFCraft.patch_pdf_with_package` 和 `PDFCraft.translate_pdf` 的默认路径。
+- Poppler：PDF 页面渲染、OCR 提取和 PDF 写回都需要它。写回会渲染源页以估计局部擦除颜色，
+  但不会将该 raster 当作输出页面。
+- Ghostscript：PDF 写回需要它将源页编译为纯视觉底图，避免原文在译文下方被选中。
 - vendor OCR：网络连接和有效的供应商配置；只要运行 OCR 提取，还需要 Poppler；本机不需要 CUDA。
 - local OCR：支持 CUDA 的 NVIDIA GPU、匹配的 PyTorch、模型缓存、足够的显存和 Poppler。
+
+PySide6/Qt 会作为 Python 依赖安装；PDF 写回还需要本机有合适的字体。行内公式的矢量渲染是
+可选能力：开启时需要 Matplotlib 和能在 `PATH` 中调用的 TeX `latex`；两者缺失或某个公式渲染
+失败时，写回不会中断，而会将该公式降级为可读的 plain text。
 
 local OCR 的显存需求取决于所选模型、`ocr_size` 和输入页面。不要把某个模型的显存
 经验值当作所有 backend 的硬性要求；如果设备资源不足，优先使用 vendor OCR。
@@ -65,7 +68,14 @@ python -m pip install "pdf-craft[local]"
 
 ## 安装 Poppler
 
-Poppler 是 pdf2image 用来读取和渲染 PDF 页面的系统工具。安装后，`pdfinfo` 应该能在
+默认 PDF 读取器使用 `pdfinfo` 和 `pdftoppm`，适用于本地和供应商 OCR。出版页码标签
+还需要 Poppler 的 GLib 库：Linux 安装 `libpoppler-glib8` 或对应 ABI 包；macOS 的
+Homebrew Poppler 已包含它，Windows 需确保 Python 能找到相应 DLL。
+自定义 handler 提供实际读取与渲染，不会额外执行整份输入门禁。
+详见[可选输入断言](ERROR_HANDLING.md#可选输入断言)。
+
+
+Poppler 提供 PDF 的只读信息、原生文本和页面渲染；出版页码标签使用其 GLib 公开 API。安装后，`pdfinfo` 应该能在
 终端中直接执行。
 
 ### macOS
@@ -80,21 +90,13 @@ brew install poppler
 
 ```bash
 sudo apt-get update
-sudo apt-get install poppler-utils
+sudo apt-get install poppler-utils libpoppler-glib8
 ```
 
 ### Windows
 
 下载适用于 Windows 的 Poppler 二进制包，将其中的 `bin` 目录加入系统 `PATH`，然后重新
-打开终端。也可以在应用层通过 `DefaultPDFHandler(poppler_path=...)` 指定 Poppler 路径：
-
-```python
-from pdf_craft import DefaultPDFHandler, PDFCraft, PDFOptions
-
-craft = PDFCraft(pdf=PDFOptions(
-    pdf_handler=DefaultPDFHandler(poppler_path="C:/tools/poppler/bin"),
-))
-```
+打开终端。
 
 ### 验证 Poppler
 
@@ -103,6 +105,55 @@ pdfinfo -v
 ```
 
 如果出现 `command not found` 或 Windows 找不到命令，请先修复 PATH，再运行 pdf-craft。
+
+直接使用非 PATH 中的工具目录时，可以调用
+`pdf_pages_count(path, pdf_handler=DefaultPDFHandler(poppler_path=directory))`
+（`DefaultPDFHandler` 从 `pdf_craft.pdf` 导入）。读取使用该目录；无效目录仍报错。
+
+升级已有部署时，也应更新 PDF 后端。PDF Craft 要求 pypdf 6.21.2 或更新的 6.x
+版本。Poppler 是独立安装的系统工具，升级 Python 包不会自动升级它。
+
+```bash
+python -m pip install --upgrade pdf-craft
+# macOS
+brew update
+brew upgrade poppler
+# Debian / Ubuntu：升级到发行版仓库提供的版本
+sudo apt-get update
+sudo apt-get install --only-upgrade poppler-utils libpoppler-glib8
+```
+
+后端升级不保证此前不兼容的文件变得可处理。
+
+## 为 PDF 写回安装 Ghostscript
+
+PDF 写回需要 Ghostscript 命令行程序：
+
+### macOS
+
+```bash
+brew install ghostscript
+```
+
+### Debian / Ubuntu
+
+```bash
+sudo apt-get update
+sudo apt-get install ghostscript
+```
+
+### Windows
+
+安装 Ghostscript 并将 `gswin64c.exe` 加入 `PATH`。在运行 Python 的同一环境中确认
+`gs --version`（或 `gswin64c --version`）可用。
+
+## 可选：PDF 行内公式矢量渲染
+
+`PatchTextOptions(render_inline_formulas=True)` 默认开启。环境中有 Matplotlib 与 TeX 时，行内
+LaTeX 会作为矢量 PDF fragment 写回；否则 pdf-craft 会安全降级为可读 plain text。
+
+在运行 pdf-craft 的 Python 环境安装 Matplotlib，并安装能让 `latex` 出现在 `PATH` 中的 TeX
+发行版即可。这与 OCR 无关；接受 plain-text 公式降级时不需要安装这些可选组件。
 
 ## local OCR 的 CUDA 环境
 
@@ -145,13 +196,13 @@ python -m pip install "pdf-craft[local]"
 从模型仓库下载较大的文件。你可以先下载模型并在之后完全离线运行：
 
 ```python
-from pdf_craft import DeepSeekOCRLocalConfig, PDFCraft, PDFOptions, predownload_models
+from pdf_craft import DeepSeekOCRLocalConfig, PDFCraft, PDFOptions
 
 download_ocr = DeepSeekOCRLocalConfig(
     models_cache_path="models",
     enable_devices_numbers=[0],
 )
-predownload_models(ocr=download_ocr)
+PDFCraft().predownload_models(ocr=download_ocr)
 
 offline_ocr = DeepSeekOCRLocalConfig(
     models_cache_path="models",

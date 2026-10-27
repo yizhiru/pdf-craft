@@ -11,7 +11,7 @@ pdf-craft 的 PDF 能力可以按使用目标分成三类：
 | --- | --- | --- |
 | 直接转换 | `convert_pdf_to_markdown` / `convert_pdf_to_epub` | Markdown 或 EPUB |
 | 转换时翻译 | 在上述入口传入一个 `translator` | 翻译后的 Markdown 或 EPUB |
-| 翻译并写回 PDF | `translate_pdf` | 以源页渲染图为背景、覆盖译文的新 PDF |
+| 翻译并写回 PDF | `translate_pdf` | 保留源页、覆盖擦除层与可提取译文文本层的新 PDF |
 
 如果只是想完成一次转换，优先使用两个 `convert_pdf_to_*` 方法。它们会在内部完成提取、
 可选内容变换和渲染。只有需要复用提取结果、分别控制每个阶段，或需要写回 PDF 时，才使用
@@ -64,14 +64,16 @@ metering = craft.convert_pdf_to_markdown("input.pdf", "output.md")
 print(metering.input_tokens, metering.output_tokens)
 ```
 
-`package_path` 默认为 `None`。省略它时，pdf-craft 使用操作系统临时目录，并在转换完成
-或发生异常后清理。需要保留中间结果进行调试或再次渲染时，传入一个可写目录：
+默认情况下，pdf-craft 使用操作系统临时 analysis 目录，并在转换完成或发生异常后清理。
+需要保留诊断信息时传入 `analysing_path`；需要复用或跨机器交换中间结果时传入
+`extraction_path` 导出 `.pcex`：
 
 ```python
 craft.convert_pdf_to_markdown(
     "input.pdf",
     "output.md",
-    package_path="work/pdf-package",
+    analysing_path="work/analysis",
+    extraction_path="work/book.pcex",
 )
 ```
 
@@ -88,7 +90,7 @@ craft.convert_pdf_to_markdown(
 
 ### 转换时翻译
 
-可以在渲染前传入一个章节翻译器，完成一次翻译，并决定译文以替换方式还是追加方式提交：
+可以在渲染前传入一个 `XMLTranslator`，完成一次翻译，并决定译文以替换方式还是追加方式提交：
 
 ```python
 from pdf_craft import SubmitKind
@@ -101,12 +103,11 @@ craft.convert_pdf_to_markdown(
 )
 ```
 
-这里的 `translator` 必须实现章节变换器接口（提供 `transform(chapter)` 方法），负责调用
-文本 LLM 并返回修改后的章节。本文只说明 pdf-craft 如何接入变换器；LLM 客户端和具体
-提示词由你的应用负责准备。
+这里的 `translator` 使用配置好的文本模型翻译结构化 XML group。章节布局及其内部变换协议
+不是公共扩展面。
 
-高层转换方法只执行一次翻译。需要额外 package 变换或更细粒度控制时，可以使用
-`extract_pdf()`、`translate_package()` 和 `render_*()` 自行组合。
+高层转换方法只执行一次翻译。需要分段或更细粒度控制时，可以使用
+`extract_pdf()`、`translate_extraction()` 和 `render_*()` 自行组合。
 
 ## PDF 转换为 EPUB
 
@@ -127,8 +128,13 @@ craft.convert_pdf_to_epub(
 
 ### EPUB 输出选项
 
-- `book_meta`：EPUB 的标题、作者、出版社等元数据；省略时尝试读取源 PDF 元数据。
-- `lan`：EPUB 内容语言标记，支持 `"zh"` 和 `"en"`。
+- `book_meta`：EPUB 的标题、作者、出版社等元数据。省略时只使用 extraction manifest 中的
+  内容；默认不会读取源 PDF 的 native metadata，也不会以文件名补全。若要自动抽取，需在
+  extraction 中显式设置 `extract_book_metadata=True` 并提供独立 `metadata_llm`：它优先采纳
+  可由前页 OCR 证据验证的结果，native PDF metadata 只能补 OCR 缺失字段。`translate_pdf()` 与
+  `patch_pdf_with_extraction()` 也会把同一份已归一化 metadata 写入输出 PDF。渲染时显式传入的
+  `book_meta` 按字段覆盖 manifest；`None`、空字符串和空的贡献者列表表示“不覆盖”，而非清空。
+- `label_language`：只选择目录、封面、前言和未命名标题等固定文案。精确的 `"zh"` / `"en"` 选择对应文案，其他字符串统一回退英文；默认 `"en"`。不限制或修改正文／翻译语言。2.6.2 起替代原来的 `lan` 关键字。
 - `table_render`：表格渲染方式，使用 `TableRender.HTML`、`TableRender.CLIPPING` 等
   `epub_generator` 提供的枚举值。
 - `latex_render`：公式渲染方式，使用 `LaTeXRender.MATHML`、`LaTeXRender.SVG` 或
@@ -146,134 +152,171 @@ craft.convert_pdf_to_epub(
 PDF 中与章节来源匹配的文字区域：
 
 ```python
-package = craft.extract_pdf("input.pdf", "work/pdf-package")
+extraction = craft.extract_pdf("input.pdf", "work/book.pcex")
 craft.translate_pdf(
     "input.pdf",
-    package,
+    extraction,
     "translated.pdf",
     translator,
+    with_furniture=True,  # 同时翻译 PCEX 中已有的页眉、页脚和页码
+    error_policy=True,  # 允许可恢复错误降级；写回失败时保留原 PDF 页
 )
 ```
 
 PDF 写回使用章节中的页面来源和边界框信息，因此不需要重新设计页面布局。`translator`
-可以是章节变换器，也可以是接收文本并返回译文的 callable：
+直接接收 `XMLTranslator`，不能是接收字符串并返回译文的 callable。该入口只翻译 narrative
+和可选 furniture；anchored 图片/表格文字缺少字段级 PDF 坐标，因此不会发起这部分翻译。
 
-```python
-def translator(text: str) -> str:
-    return call_text_llm(text)
+`with_furniture` 默认是 `False`，因为翻译页面 furniture 会增加一次 LLM 工作。仅当 PCEX
+已含有 `furnitures.xml` 时才开启；通常直接 PDF → PCEX 时，默认的
+`ExtractionOptions.includes_furniture=True` 会保留它。PDF → Markdown / EPUB 的便利流程会明确
+不提取、不翻译 furniture，因为这两种输出不渲染固定页面 furniture。
 
-craft.translate_pdf("input.pdf", package, "translated.pdf", translator)
-```
+默认情况下，PDF 写回的异常会立即终止操作。线上服务可以为 `translate_pdf` 或
+`patch_pdf_with_extraction` 传入 `error_policy=True`：某页的擦除、译文文字层、行内公式或 PDF
+合成发生任意普通异常时，该页会保留原始 PDF 页面，其他页继续写回；完整
+traceback 会写入日志。若所有需要写回的页面都退回，则抛出 `NoUsableFillPagesError`，而不是生成
+看似成功、实际未写入译文的 PDF。无法打开、枚举或建立视觉底图的源 PDF 没有页级恢复载体，仍会
+直接失败。
 
-PDF 输出不接受 `APPEND_BLOCK` 模式，因为 PDF pipeline 不能在原页面中安全追加新的块级内容。
+`error_policy` 也可以是同步或异步判断函数，接收最终失败的 `FailureContext`，读取结构化错误、
+来源与影响范围后返回 bool。顶层 callback 决定所有可降级类别；若只决定 PDF 写回失败，使用
+`ErrorPolicy(ignore_pdf_fill_errors=callback)`。除非业务能接受“某些页面保留原始 PDF 内容、
+其他页面已有译文”的混合结果，否则应保持默认严格失败。详见[错误处理与迁移指南](ERROR_HANDLING.md)。
 
 ### PDF 输出的限制
 
-- PDF 写回明确不支持 `APPEND_BLOCK`，因为 PDF pipeline 不能在原页面中安全追加新的
-  块级内容；`REPLACE` 与 `APPEND_TEXT` 不会被该入口预先拒绝。
-- 写回前会检查结果是否带有页面几何元数据、章节和几何中涉及的页码是否落在源 PDF 页数
+- PDF 翻译固定写入纯译文，不接受 `SubmitKind`。
+- 默认写回会检查结果是否带有页面几何元数据、章节和几何中涉及的页码是否落在源 PDF 页数
   范围内，以及每个章节页面是否具有对应的几何记录。它不验证结果目录是否确实由该源 PDF
-  提取而来，因此调用方应自行确保二者匹配。
-- 每个源页会先被渲染成图像，再与覆盖后的译文一起写入输出 PDF。因此输出页以源页图像为
-  背景，不保留原 PDF 的矢量文字、链接、注释等页面对象；需要这些对象或可编辑矢量内容时，
-  应评估该流程是否适用。
-- 写回只处理 `ref` 为 `text` 或 `sub_title` 的 `ParagraphLayout`。图片、表格以及其他
+  提取而来，因此调用方应自行确保二者匹配；开启 `error_policy=True` 后，能归属到某页的
+  几何错误可以按策略让该页保留原始 PDF 内容。
+- 写回前，Ghostscript 会将每个源页的非 Annotation 内容编译为无字体的纯视觉底图。源矢量
+  文字仍以线条显示，但不再可选中、搜索或提取；隐藏 OCR 文字也会被移除。源页完整的
+  `/Annots` 数组会在译文之上重新挂载，因此链接、高亮、批注、表单控件及其他 PDF Annotation
+  保持独立且可交互。译文是唯一普通可选择的文字层。
+- 写回只处理 `role` 为 `body` 或 `heading` 的 `TextFlowItem`。图片、表格以及其他
   布局不会成为可替换项。
-- 每段译文都必须在对应 OCR bbox 内排版。默认排版策略会在允许的字号范围内寻找可容纳的
-  字号；最小字号仍无法容纳时抛出 `ValueError`。所有 bbox 会先完成预检，因此失败时不会
-  留下部分输出文件。
-- `patch_pdf_with_package` 是写回已有 PDF 的操作，不是通用 PDF 排版器，不能只凭提取结果
+- 正文译文优先在对应 OCR bbox 内排版。默认排版策略会在允许的字号范围内寻找可容纳的
+  字号；最小字号仍无法容纳时，会以最小字号从首个 bbox 强制写入全文，即使越过普通 bbox
+  与障碍物边界。标题在最终选定字号仍无法装入 bbox 时，
+  会从 bbox 左侧中点起按自然宽度向右绘制，而不会中断或跳过整份输出。
+- `patch_pdf_with_extraction` 是写回已有 PDF 的操作，不是通用 PDF 排版器，不能只凭提取结果
   生成一个没有原始页面的全新 PDF。
 
-### `patch_pdf_with_package`
+### `patch_pdf_with_extraction`
 
 如果译文已经由其他流程生成，可以跳过 `translate_pdf`，直接把一个结果写回原始 PDF：
 
 ```python
-craft.patch_pdf_with_package(
+craft.patch_pdf_with_extraction(
     "input.pdf",
-    "work/translated-package",
+    "work/translated.pcex",
     "translated.pdf",
+    translation_id="zh-main",
 )
 ```
 
-传入路径时，该目录必须符合 pdf-craft 的渲染结果契约；也可以直接传入
-`DocumentPackage` 对象。这个入口不会调用 OCR 或 LLM。PDF 写回使用 `pypdf` 和
-`reportlab`，它们是 pdf-craft 当前的直接运行时依赖；在依赖被移除或非标准安装的环境中，
-底层导入失败会抛出 `RuntimeError`。
+传入路径时必须是通过校验的 `.pcex`；也可以直接传入 `PDFCraftExtraction` 对象。普通目录
+不是公开输入。省略 `translation_id` 时写回当前 PCEX 根内容；显式指定时选择对应翻译版本的
+正文、metadata 和可选 furniture。anchored 图片/表格文字没有字段级 PDF 坐标，本轮不会写回
+PDF。这个入口不会调用 OCR 或 LLM。PDF 写回使用 `pypdf`、`reportlab`、PySide6/Qt、
+本机 Ghostscript，以及 Poppler（默认用于局部背景取色，也可使用调用方提供的 `AsyncPDFHandler`）进行局部背景取色；在依赖被移除或
+非标准安装的环境中，底层导入失败会抛出 `RuntimeError`。
 
 ### 调整写回排版
 
-`PDFCraft.translate_pdf` 与 `PDFCraft.patch_pdf_with_package` 为简化调用而设计，不提供字体、
-字号、对齐、padding 或 overflow 策略参数。需要调整这些规则时，使用公开的低层
-`PDFPatcher` 与 `PatchTextOptions`，再交给 `PDFTranslationPipeline`：
+`PDFCraft.translate_pdf` 与 `PDFCraft.patch_pdf_with_extraction` 为简化调用而设计，不提供字体、
+字号、对齐或 padding 参数。需要调整这些规则时，使用公开的低层
+`PDFPatcher`、`PatchTextOptions` 与 `EraseOptions`，再交给 `PDFTranslationPipeline`：
 
 ```python
 from pathlib import Path
 
-from pdf_craft import PDFPatcher, PDFTranslationPipeline, PatchTextOptions
+from pdf_craft import EraseOptions, PDFPatcher, PDFTranslationPipeline, PatchTextOptions, PatchTextStyle
 
 patcher = PDFPatcher(options=PatchTextOptions(
-    font_name="STSong-Light",
+    font_name="Noto Sans CJK SC",  # 优先字体；缺失时由 Qt fallback
     max_font_size=14,
     min_font_size=5,
     alignment="left",
     horizontal_padding=1,
     vertical_padding=1,
-    overflow="error",
-))
+    styles={"heading": PatchTextStyle(max_font_size=18, min_font_size=8)},
+), erase_options=EraseOptions(padding=2))
 pipeline = PDFTranslationPipeline(patcher=patcher)
-pipeline.translate(Path("input.pdf"), Path("translated.pdf"), package, translator)
+await pipeline.patch(Path("input.pdf"), Path("translated.pdf"), translated_extraction)
 ```
 
-`overflow="error"` 是默认策略，无法容纳的译文会失败；`overflow="skip"` 会跳过该 bbox，
-并将原因记录在 `patcher.skipped_replacements`。低层 API 适用于愿意自行处理排版策略、
-跳过结果和输出文件生命周期的高级调用方。
+若合法 bbox 在最小字号仍无法容纳完整译文，patcher 会固定从第一个来源 bbox 强制写入全文，允许越过普通 bbox
+和障碍物边界，避免整份 PDF 失败。低层 API 适用于愿意自行处理排版策略和输出文件生命周期的高级调用方。
 
-### 自定义 PDFHandler 与写回 DPI
+当 `PatchTextOptions` 或某个 `PatchTextStyle` 未指定 `max_font_size` 时，文字按 bbox 的可用几何空间自动寻找最大可行字号，而不是采用某个默认视觉字号。搜索会从内部初始探测值开始，持续扩张直到下一字号无法放入来源 bbox；实际结果始终由最大可行字号决定。调用方显式提供数值 `max_font_size`（包括 `12`）时，该数值仍是硬上限。
 
-`PDFHandler` 是 PDF 文件访问层的公开协议，它本身只需要提供
-`open(Path) -> PDFDocument`。其返回的 `PDFDocument` 则需要能读取页数、页面尺寸和元数据，
-通过 `render_page(page_index, dpi)` 将页面渲染为图像，并实现 `close()`。pdf-craft 会在提取与
-写回的 `finally` 中调用文档的 `close()`，因此自定义 handler 返回的文档必须在该方法中释放它
-持有的文件、渲染器等资源。默认实现是 `DefaultPDFHandler`。只有需要替换 PDF 渲染实现、指定
-Poppler 位置，或让应用统一管理 PDF 文件访问时，才需要注入自定义 handler；通常无需自行实现它。
+### 标题层级与有界布局窗口
 
-在门面 API 中，将 handler 放进 `PDFOptions.pdf_handler`。它会用于 PDF 提取；在
-`translate_pdf` / `patch_pdf_with_package` 中也会传入 PDF 写回链路：
+PDF 写回把一个 `TextFlowItem` 视为一段连续文本流，即使它的来源 bbox 跨多个页面也如此。
+第一阶段为整段选择统一字号；一整行若放不下当前 bbox，会整体移入下一个 bbox，绝不会在单个
+bbox 的边界局部溢出。随后每页会按文字等级的字符数加权平均字号，对各 bbox 在不改变已冻结的
+行数和文字分配的前提下作局部归一化；因此最终同段不同 bbox 的字号可以略有差异。Qt 保留原生的
+脚本 shaping、断行、字体 fallback 和字形定位能力；除矢量行内公式及其紧随空白作为不可拆分原子外，
+pdf-craft 不额外施加语言特定断行规则。
+
+在一个可释放的页面窗口中，`body` 正文会先于 `heading` 标题完成排版。标题涉及的每一页中，
+已排版正文的最大字号乘以 `headline_min_body_ratio`（默认 `1.2`）后，构成标题字号的优先下限。
+
+数值 `max_font_size` 对所有语义样式都是硬上限，包括从 `PatchTextOptions` 隐式继承的 `heading`。
+当该上限小于正文相对字号时，上限在第一阶段拟合和第二阶段的页内归一化中都会优先；某个语义样式可以通过
+`minimum_body_font_ratio` 覆盖比例，但不能突破字号上限。如果标题在最终选定的字号仍放不下 bbox 的宽度，
+它会锚定来源框的左边缘并自然向右延伸，而不会失败或被跳过。
 
 ```python
-from pdf_craft import DefaultPDFHandler, PDFCraft, PDFOptions
-
-craft = PDFCraft(pdf=PDFOptions(
-    ocr=ocr_config,
-    pdf_handler=DefaultPDFHandler(poppler_path="/opt/poppler/bin"),
-))
+options = PatchTextOptions(
+    styles={
+        "body": PatchTextStyle(font_name="Noto Serif CJK SC", max_font_size=11),
+        "heading": PatchTextStyle(
+            font_name="Noto Sans CJK SC",
+            max_font_size=24,
+            minimum_body_font_ratio=1.35,
+        ),
+    },
+    headline_min_body_ratio=1.2,
+    headline_fallback_font_size=14,
+)
 ```
 
-PDF 写回的低层入口还提供两个独立的注入点，签名和默认值如下：
+若标题所在页没有实际排版出的正文，字号参考按确定顺序选择：当前窗口中较早页面的正文、此前
+已完成窗口的正文、当前窗口中较晚页面的正文，最后才是 `headline_fallback_font_size`（未设置时
+使用标题样式自身的最小字号）。标题无法满足这个硬性下限时，仍会保留该最小字号，从 bbox 左边的
+中点开始以自然宽度向右绘制；这属于正常布局结果，不会记录为错误、跳过 replacement 或中断写回。
 
-| 入口 | 参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `PDFPatcher` | `pdf_handler`、`dpi` | `None`、`300` | 以 handler 将每个源页渲染为输出 PDF 的图像背景；没有任何替换项的页面使用其 `dpi`。 |
-| `PDFTranslationPipeline` | `pdf_handler`、`patcher`、`dpi` | `None`、`None`、`300` | 当结果目录缺少页面像素尺寸元数据时，用 handler 以该 `dpi` 渲染源页来解析尺寸；由它收集的替换项也携带该 `dpi`，供 patcher 渲染相应页面背景。 |
+窗口会在所有仍可能触及其中页面的自然段完成规划后关闭。之后 patcher 会逐页渲染原始图、
+取色、合成并释放该页图片。因此即使一个很长的跨页自然段覆盖整本书，也不会在内存中累计整本书的
+页面 raster；独立的擦除层和 Qt 文本层依然互不耦合。
 
-`dpi` 越高，源页背景通常越清晰，但生成的 PDF 也会更大、写回更慢。若传入自定义
-`PDFPatcher`，应在它自身同时设置 `pdf_handler` 与 `dpi`；此时 pipeline 不会用自己的
-handler 或 dpi 重建该 patcher。保持二者使用同一 handler 和 dpi，能避免缺失页面尺寸元数据时
-的解析与最终背景渲染不一致：
+### 写回的页面与文本层
 
-```python
-from pdf_craft import DefaultPDFHandler, PDFPatcher, PDFTranslationPipeline
+写回不会将整页通过 `AsyncPDFDocument.render_page()` 栅格化。Ghostscript 先将源页的非 Annotation 内容
+编译为无字体的纯视觉底图，再依次合并独立的矩形擦除 overlay 和由 Qt `QTextLayout` / PDF paint
+device 生成的译文文本 overlay。因此扫描页仍会自然保留扫描背景，原生 PDF 页也不会因写回而压扁；
+源文字与隐藏 OCR 文字均不再可选择、搜索或提取，译文是唯一普通可选择的文字层。原 `/Annots` 数组
+会在译文之上重新挂载，链接、高亮、批注、表单控件等 Annotation 保持独立且可交互。
 
-handler = DefaultPDFHandler(poppler_path="/opt/poppler/bin")
-patcher = PDFPatcher(pdf_handler=handler, dpi=200)
-pipeline = PDFTranslationPipeline(pdf_handler=handler, patcher=patcher, dpi=200)
-```
+擦除会先以 padding 扩大每个来源 bbox，然后只渲染原始页来计算该矩形内按频次加权的 RGB 中位背景色，
+再以这个颜色完整覆盖扩展矩形。渲染页不会作为输出页。当前擦除不恢复纸张纹理、表格线、公式或插图。
+写回需要本机具备 PySide6/Qt、Ghostscript、Poppler（默认用于局部背景取色，也可使用调用方提供的 `AsyncPDFHandler`）和可用字体；省略或
+留空 `font_name` 时，会从 Qt 字体库自动选取一个本机真实字体并在整次写回中固定。显式指定的字体只是
+优先选择，Qt 找不到指定字体或字形时会使用系统 fallback，不会因此中断写回。
 
-门面 `PDFCraft` 不公开单独的 PDF 写回 dpi 参数；其标准写回链路使用默认 `300`。不要把
-`ExtractionOptions.dpi` 当作写回背景的设置：前者控制提取/OCR 时的页面渲染，并写入提取结果
-的页面像素元数据；需要控制写回背景清晰度时，使用上述低层 API。
+行内公式在章节 XML 中以专门节点保留，因而会参与段落翻译的上下文，但其源公式不会被翻译替换。
+翻译模型可以把公式写成“16倍”等自然文本；结构填充先按这份译文进行严格全文校验，
+通过后再由程序恢复原始公式。最终显示的公式因此可能不同于模型译文中的文字写法；
+这种恢复发生在填充修复循环之后，不会因为表示差异而反复请求模型。
+`PatchTextOptions(render_inline_formulas=True)` 是默认行为：环境同时具备 Matplotlib 和本机 TeX 时，
+会把公式绘成 PDF 矢量内容；未安装这些可选运行时或单个公式渲染失败时，会自动以可读的 plain text
+降级，整份 PDF 不会因此失败。设为 `False` 可主动使用相同的 plain-text 行为。矢量公式片段会附带
+plain-text 的 PDF `/ActualText` 语义替代；这不是完整的 tagged PDF，因此不同阅读器中公式相对正文的
+拖选与复制顺序不作保证。
 
 ## 原子 API
 
@@ -281,28 +324,32 @@ pipeline = PDFTranslationPipeline(pdf_handler=handler, patcher=patcher, dpi=200)
 
 ### `extract_pdf` 与 `extract_pdf_with_metering`
 
-这两个方法将 PDF 提取为 `DocumentPackage`。`package_path` 是必填项，因为返回对象仍然
-依赖该目录中的文件；与一次性转换不同，提取方法不会自动创建并清理临时目录。
+这两个方法将 PDF 提取为 `PDFCraftExtraction`。`.pcex` 输出路径是必填项；该文件可以直接
+存储、上传或交给另一台机器上的后端。普通目录不能作为后端公开输入。
 
 `extract_pdf_with_metering` 额外返回 `OCRTokensMetering`，用于读取本次 OCR 的输入和输出
 token 计量：
 
 ```python
-package, metering = craft.extract_pdf_with_metering(
+extraction, metering = craft.extract_pdf_with_metering(
     "input.pdf",
-    "work/pdf-package",
+    "work/book.pcex",
 )
 ```
 
 ### `render_markdown` 与 `render_epub`
 
-这两个方法只负责渲染已有 `DocumentPackage`，不会重新 OCR。它们适合在提取或变换完成后
+这两个方法只负责渲染已有 `PDFCraftExtraction`，不会重新 OCR。它们适合在提取或变换完成后
 重复生成不同输出格式。
 
-### `translate_package`
+### `translate_extraction`
 
-`translate_package` 将一个结果目录中的章节交给章节变换器，并生成另一个结果目录。它是
-库中唯一面向结果目录翻译的公开入口；任意变换链不属于公共 API。
+`translate_extraction` 接收 `XMLTranslator`，为已有 `.pcex` 生成一个可独立选择的翻译版本。
+narrative 与 metadata 固定翻译；`with_anchored` 和 `with_furniture` 只负责启用各自的标准阶段，
+不会更换翻译算法。调用方可指定或自动生成短 `translation_id`，同一目标语言允许多个 ID；
+`list_translations` 返回 ID、目标语言和创建时间。保存的翻译版本只包含纯译文，双语或替换属于后续
+渲染选择。Markdown、EPUB 与 PDF 写回均可选择 `translation_id`；没有译文的单元自然回退原文。
+它不会重新 OCR。PDF 写回当前只处理正文和页面 furniture，不写回图片/表格中的文字。
 
 ## `ExtractionOptions`
 
@@ -316,33 +363,75 @@ package, metering = craft.extract_pdf_with_metering(
 | `max_page_image_file_size` | `None` | 限制页面图片大小，必要时调整分辨率 |
 | `max_ocr_tokens` / `max_ocr_output_tokens` | `None` | 限制 OCR 请求的 token 数 |
 | `includes_cover` | `False` | 生成封面图片 |
-| `includes_footnotes` | `False` | 提取脚注内容 |
+| `footnotes` | `None` | `None` 关闭脚注；`FootnoteOptions()` 使用传统算法；配置 `FootnoteRefinement` 后启用 JEV + LLM 矫正 |
+| `includes_furniture` | `True` | 将 native PDF 的页眉、页脚和页码等页面 furniture 保留为 `furnitures.xml`；不翻译它们 |
+| `extract_book_metadata` | `False` | 从前几页 OCR 提取书目元数据 |
+| `metadata_llm` | `None` | 开启 `extract_book_metadata=True` 时必需的独立 LLM；不复用 `toc_llm` |
 | `generate_plot` | `False` | 生成图表相关资源 |
 | `toc_assumed` | `False` | 是否假定 PDF 中存在目录页 |
 | `toc_llm` | `None` | 使用文本 LLM 辅助分析复杂目录层级 |
-| `ignore_pdf_errors` / `ignore_ocr_errors` | `False` | 按布尔值或 callable 决定是否跳过页面级错误 |
 | `aborted` | 始终返回 `False` 的回调 | 外部中断检查回调 |
-| `on_ocr_event` | 无操作回调 | 接收 OCR 页面事件的回调 |
+| `on_extraction_event` | 无操作回调 | 接收 OCR 页面事件的回调 |
+| `on_body` / `on_footnote` | `None` | 提取过程中接收独立 PCEX XML 快照 |
+| `on_metadata` | `None` | 一次性接收定稿后的 `MetadataContent` |
+| `context` | `None` | 调用方持有的 `ExtractionContext`，用于页面几何和活跃期间的资源访问 |
+
+页面渲染和 OCR 的降级通过门面或单次操作的 `error_policy` 配置，不属于
+`ExtractionOptions`。详见[错误处理与迁移指南](ERROR_HANDLING.md)。
+
+直接 PDF → PCEX 时，`includes_furniture=True` 是默认行为：它只保留可从 native PDF 文本识别的
+页眉、页脚和页码等 furniture，不会请求翻译；扫描页没有这类 native 文本时可以自然不产生 furniture。
+
+`convert_pdf_to_markdown()` 和 `convert_pdf_to_epub()` 会明确把它覆盖为 `False`，即使调用方传入的
+`ExtractionOptions` 将其设为 `True`，因为 Markdown 和 EPUB 都不渲染固定页面 furniture。
+
+开启 `extract_book_metadata=True` 时必须提供 `metadata_llm`；其结果会保存在 PCEX 中，并在该 PCEX 回填
+PDF 时写入输出 PDF 的 metadata。其前页 OCR 证据、最多读取页数和 native PDF metadata 的补全规则见
+[API 参考](API_REFERENCE.md#extractionoptions)。
 
 `ExtractionOptions` 同时适用于 Markdown 和 EPUB。`toc_assumed` 的公共默认值始终是
 `False`，包括 `convert_pdf_to_epub`；若你的 PDF 确实包含需要按目录页处理的目录，应显式
 传入 `ExtractionOptions(toc_assumed=True)`。
 
-没有显式设置 `dpi` 时，提取时实际以 `300` DPI 渲染页面，且生成的 `document.json` 会记录
-`"dpi": 300`；`ExtractionOptions.dpi` 的 `None` 表示采用该默认值，不表示没有 DPI。提高
+没有显式设置 `dpi` 时，提取时实际以 `300` DPI 渲染页面，且生成的 `pages.xml` 会记录
+该值；`ExtractionOptions.dpi` 的 `None` 表示采用默认值，不表示没有 DPI。提高
 提取 DPI 可能改善小字或细节的 OCR 输入，但同时增加图像尺寸、处理时间和资源消耗。页面像素
-尺寸会随提取 DPI 写入 `document.json`，供后续 PDF 写回将 OCR bbox 对齐到源页。
+尺寸会随提取 DPI 写入 `pages.xml`，供后续 PDF 写回将 OCR bbox 对齐到源页。缺少几何时
+后端会直接拒绝，不会读取 OCR 缓存或重新渲染 PDF 来补齐。
 
 ## 计量、进度与中断
 
 - `extract_pdf_with_metering` 与两个 `convert_pdf_to_*` 入口都会返回 `OCRTokensMetering`，
   可用于记录 OCR token 使用量。
-- `ExtractionOptions.on_ocr_event` 在 OCR 页面事件发生时回调，适合显示页面级进度。
+- `ExtractionOptions.on_extraction_event` 在 OCR 页面事件发生时回调，适合显示页面级进度。
 - `ExtractionOptions.aborted` 会在提取和渲染阶段被检查；返回 `True` 时当前操作中断。
-- PDF 写回和内容变换中的异常应由调用方捕获；`ignore_*_errors` 只针对提取阶段的页面级
-  错误。
+- PDF 写回和内容变换中的异常通常应由调用方捕获；但 `translate_pdf` 与
+  `patch_pdf_with_extraction` 的 `error_policy=True` 会恢复可明确归属到某一页的写回异常。
+
+## 提前展示内容与 PDF 排版
+
+2.5.0 提供可选 `on_body` / `on_footnote`：PDF 提取时在 `ExtractionOptions` 中传入，
+接收独立 PCEX XML 快照；PCEX 翻译及 Markdown/EPUB 渲染直接传入，接收
+`ParagraphContent[SourceRegion]`。一个回调对应完整自然段，保留全部跨页来源区域，
+Markdown 原译文分开。`render_markdown` / `render_epub` 可传 `translator` 边翻译边渲染，
+不必先生成完整译本；不能同时指定已有译文的 `translation_id`。
+
+PDF 回填及 `translate_pdf` 接收相同两条回调，但产物为最终排版后的 `PDFParagraphContent`，
+包含来源区域、字号、行、公式和擦除框，坐标以来源 OCR 像素为单位。它是段落预览数据，
+不是一页 PDF 或已提交的最终文件。
+
+`ExtractionOptions.on_metadata` 观察提取元信息；启用 LLM 元信息提取时，等待与原生 PDF
+fallback 合并后再通知。翻译入口的 `on_metadata` 独立观察翻译元信息；一键转换时，两者仍
+分别对应提取和翻译。使用 `read_pages()` / `read_asset()` 读取公开的几何与资源。
+回调支持同步及异步函数，异步回调会被等待。示例、坐标映射、时机及文件提交语义见
+[增量回调指南](STREAMING.md)。
 
 ## 相关限制
 
 本文只描述库的 PDF 工作流。OCR backend 的具体配置、模型缓存和 CUDA 条件请参考 OCR
 backend 配置指南；已有 EPUB 的翻译和其 LLM 参数请参考 EPUB 翻译指南。
+
+
+统一策略、默认严格失败和全局全部降级的规则见 [错误处理](ERROR_HANDLING.md)。
+
+翻译进度使用原文 words 累计值，见[统一计数和事件约定](TRANSLATION_PROGRESS.md)。

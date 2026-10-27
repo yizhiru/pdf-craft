@@ -9,7 +9,9 @@ Use it for either a target-language edition or a bilingual edition that retains 
 Configure a text LLM that exposes an OpenAI-compatible Chat Completions endpoint, then choose a target language and submission mode.
 
 ```python
-from pdf_craft import LLM, PDFCraft, SubmitKind
+from pdf_craft import (
+    ConcurrentExecutor, FixedCapacity, LLM, PDFCraft, SubmitKind,
+)
 
 llm = LLM(
     key="your-api-key",
@@ -17,6 +19,7 @@ llm = LLM(
     model="gpt-4.1-mini",
     token_encoding="o200k_base",
 )
+executor = ConcurrentExecutor(FixedCapacity(4))
 
 PDFCraft().translate_epub(
     "source.epub",
@@ -24,6 +27,7 @@ PDFCraft().translate_epub(
     target_language="zh",
     submit=SubmitKind.APPEND_BLOCK,
     llm=llm,
+    executor=executor,
 )
 ```
 
@@ -46,16 +50,18 @@ For example:
 PDFCraft().translate_epub(
     "source.epub", "book.zh.epub",
     target_language="zh", submit=SubmitKind.REPLACE, llm=llm,
+    executor=executor,
 )
 
 # A bilingual edition with visibly separate original and translated paragraphs.
 PDFCraft().translate_epub(
     "source.epub", "book.bilingual.zh.epub",
     target_language="zh", submit=SubmitKind.APPEND_BLOCK, llm=llm,
+    executor=executor,
 )
 ```
 
-The table of contents and translatable book metadata are translated too. Their structure cannot safely gain separate blocks, so `APPEND_BLOCK` is treated as inline append for those two areas while chapter bodies retain the requested block layout.
+The table of contents, XHTML document titles, and translatable book metadata are translated too. EPUB 2 NCX `docTitle` follows the translated book title, and `dc:language` is set directly to `target_language`. Structures that cannot safely gain separate blocks use inline append while chapter bodies retain the requested block layout.
 
 ## Configure the text LLM
 
@@ -104,14 +110,12 @@ PDFCraft().translate_epub(
         "and footnote numbers."
     ),
     max_group_tokens=2600,
-    concurrency=4,
+    window=4,
+    executor=executor,
 )
 ```
 
-- `user_prompt` adds project-specific requirements such as terminology or tone. It supplements rather than replaces pdf-craft's structural instructions.
-- `max_group_tokens` defaults to `2600`. Larger groups make fewer, larger requests and increase the cost of retrying a failed request.
-- `concurrency` defaults to `1`. Increase it gradually only after confirming the provider's rate limits and cost behavior. Output order remains stable.
-- `max_retries` controls XML structure-repair attempts and defaults to `5`. It is distinct from `LLM.retry_times`, which controls text-request retries.
+See [retry and recovery policies](ERROR_HANDLING.md) for failure decisions and retry budgets.
 
 ### Use separate translation and repair models
 
@@ -130,7 +134,7 @@ fill_llm = LLM(
 PDFCraft().translate_epub(
     "source.epub", "translated.epub",
     target_language="zh", submit=SubmitKind.APPEND_BLOCK,
-    translation_llm=translation_llm, fill_llm=fill_llm,
+    translation_llm=translation_llm, fill_llm=fill_llm, executor=executor,
 )
 ```
 
@@ -138,38 +142,58 @@ Supply `llm`, or supply both specialized configurations. A translation-only conf
 
 ## Observe progress and structural failures
 
-`on_translation_event` receives low-level `TranslationEvent` values as the translation
-scope and its TOC, metadata, and chapter items progress. Character counts are based on
-source text and are not token-based percentages. The same callback is supported by
-package and PDF translation workflows.
+`on_translation_event` reports source **words**, with the whole-book total
+pre-scanned before the first model call and PROGRESS after each finalized
+translation round. See [translation progress](TRANSLATION_PROGRESS.md) for the
+counting rule and event fields shared with PCEX/PDF translation.
 
-`on_fill_failed` receives `FillFailedEvent` when an XML repair attempt fails. The final event with `over_maximum_retries=True` signals that no repair attempts remain and the output may need inspection.
+See [retry and recovery policies](ERROR_HANDLING.md) for failure decisions and retry budgets.
 
 ```python
-from pdf_craft import FillFailedEvent, TranslationEventKind
-
-def on_translation_event(event):
-    if event.kind == TranslationEventKind.PROGRESS:
-        print(event.completed_characters, event.total_characters)
-
-def report_fill_failure(event: FillFailedEvent) -> None:
-    if event.over_maximum_retries:
-        print(f"Unrecovered EPUB structure error: {event.error_message}")
-
-PDFCraft().translate_epub(
-    "source.epub", "translated.epub",
-    target_language="zh", submit=SubmitKind.APPEND_BLOCK,
-    llm=llm, on_translation_event=on_translation_event,
-    on_fill_failed=report_fill_failure,
-)
+# Decide final recoverable failures with error_policy; see ERROR_HANDLING.md.
+def allow_failure(failure):
+    print(failure.stage, failure.targets, failure.affected)
+    return True
 ```
 
 ## Input and output expectations
 
 - Use a readable EPUB input and a different output path.
 - The pipeline follows the EPUB spine and preserves the package's required `mimetype` entry.
-- Technical metadata such as identifiers, dates, language markers, `meta`, and contributor fields is not sent to the LLM. Other text metadata may be translated.
+- Technical metadata such as identifiers, dates, language markers, `meta`, and contributor fields is not sent to the LLM. The output language marker is set directly from `target_language`; other text metadata may be translated.
 - The current implementation requires a recognizable table-of-contents file. An EPUB with a TOC file but no entries can proceed; one with no recognizable TOC fails instead of silently skipping that stage.
 - An unrecoverable error means the destination should not be treated as a complete translation. Inspect the callback report and any `log_dir_path` output, then rerun to a fresh output path.
 
 For endpoint, cache, or empty-response errors, see [Troubleshooting](TROUBLESHOOTING.md).
+
+
+## Receive translated content before the EPUB is ready
+
+Pass `on_body` to receive `EpubFragmentContent(epubcfi, original, translated)` for
+accepted atomic fragments, which can be smaller than a paragraph. Text is plain
+and excludes overlapping LLM context. The optional range CFI addresses the input
+EPUB, not the translated output. `epubcfi` is `str | None`: XHTML retains precise
+locations, while `text/html` or missing reliable location information yields `None`
+without suppressing original/translated text. In mixed-format books, other
+fragments keep their reliable CFIs. Check for `None` before using a location.
+Only known location unavailability is downgraded; parsing, translation, unexpected
+mapping errors and callback exceptions still propagate. Chapter paths relative
+to a nested OPF, including `../`, are supported.
+
+`on_metadata` receives one complete `MetadataContent` for OPF book metadata.
+In bilingual modes it still separates translated metadata from the original;
+this does not change the append mode used in the final EPUB. Body callbacks do
+not report navigation, document-head titles, or book metadata.
+
+Both callbacks accept synchronous or asynchronous functions. They are optional;
+async functions are awaited, and exceptions abort the operation. The output EPUB
+is published as a complete file after success. See [incremental callbacks](STREAMING.md)
+for examples, CFI details, ordering and source lifetime.
+
+
+See [error handling](ERROR_HANDLING.md) for strict defaults, source locations and task-wide all-fallback protection.
+
+Temporary LLM limits are recovered by the executor's `RateLimitScope` without consuming
+`LLM.retry_times`. See [shared rate-limit scopes](API_REFERENCE.md#shared-rate-limit-scopes).
+
+See [the unified unit lifecycle and source-word contract](TRANSLATION_PROGRESS.md).

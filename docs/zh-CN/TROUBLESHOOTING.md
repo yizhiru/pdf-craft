@@ -1,12 +1,19 @@
 # 故障排查指南
 
+## 输入兼容性
+
+需要在转换前定位读取、渲染或编辑问题时，可使用[可选输入断言](ERROR_HANDLING.md#可选输入断言)。
+查看原始异常及 traceback：命令或动态库缺失属于安装问题，解析或渲染失败表示当前
+后端无法完成对应操作。SDK 不会自动修复输入。
+
 本文面向已经安装 pdf-craft、准备处理实际文件的用户。排查时建议先确认问题发生在
 哪一层：PDF 读取、OCR 识别、文本 LLM、渲染输出，还是 PDF/EPUB 翻译。
 
 ## 先做三项检查
 
 1. 确认输入文件确实存在，并且当前进程对它有读取权限。
-2. 确认系统可以找到 Poppler。pdf-craft 通过它把 PDF 页面渲染成 OCR 所需的图像。
+2. 确认系统可以找到 Poppler。pdf-craft 通过它把 PDF 页面渲染成 OCR 所需的图像，也在翻译 PDF
+   写回时用于局部背景取色。
 3. 确认你选择的 OCR 运行位置与设备匹配：local OCR 需要支持 CUDA 的 NVIDIA GPU，且需要
    安装 `pdf-craft[local]` 可选依赖；vendor OCR 需要网络、服务地址和凭据。
 
@@ -18,20 +25,22 @@ OCR 请求成功并不代表翻译 LLM 已经配置正确。
 | 现象 | 优先检查 |
 | --- | --- |
 | `Poppler not found in PATH` | Poppler 是否安装、命令是否在 PATH 中 |
+| PDF 写回启动失败或提示 Ghostscript | Ghostscript 是否安装、`gs` 是否在 PATH 中 |
+| 行内公式只显示 plain text 而非矢量公式 | Matplotlib 和本机 TeX 是否安装；否则这是预期降级 |
 | local OCR 报 CUDA 不可用 | PyTorch 是否为 CUDA 版本、驱动和 GPU 是否可见 |
 | local OCR 提示缺少运行时 | 是否安装了 `pdf-craft[local]` |
 | local OCR 报找不到模型 | 模型缓存路径、`local_only` 和模型是否已下载 |
 | vendor OCR 请求失败 | endpoint、模型名、API key、网络和供应商配额 |
 | EPUB/PDF 翻译时报 LLM 错误 | 文本 LLM 的 URL、模型、密钥和 token 编码 |
 | 输出文件没有生成 | 输出目录权限、输入文件类型和前一步是否已经失败 |
-| PDF 写回时报 package 或页面错误 | 原始 PDF 是否与提取结果匹配、页面几何信息是否存在 |
+| PDF 写回时报 extraction 或页面错误 | 原始 PDF 是否与 `.pcex` 匹配、`pages.xml` 是否完整 |
 
 ## PDF 和 Poppler 问题
 
 ### `Poppler not found in PATH`
 
-pdf-craft 需要 Poppler 将 PDF 页面渲染为图像。这个错误与 OCR backend 无关，在切换
-local/vendor OCR 之前都必须先解决。
+pdf-craft 需要 Poppler 将 PDF 页面渲染为图像，也会在翻译 PDF 写回时用它对局部背景取色。这个错误
+与 OCR backend 无关；除非调用方传入其他 `AsyncPDFHandler`，否则在切换 local/vendor OCR 之前都必须先解决。
 
 先在系统终端确认 `pdfinfo` 可执行，并检查它输出的版本信息。如果命令不存在，将 Poppler
 安装目录加入 PATH 后重新启动终端或 Python 进程。也要确认传入的是一个有效的 PDF，而不是
@@ -42,13 +51,15 @@ local/vendor OCR 之前都必须先解决。
 先用其他 PDF 阅读器打开输入文件，确认文件没有损坏，并确认当前用户有读取权限。密码保护、
 损坏的交叉引用表、异常页面尺寸或极端复杂的 PDF 结构，都可能在页面渲染阶段失败。
 
-pdf-craft 的提取选项支持 `ignore_pdf_errors`。设为 `True` 可以让单页错误不立即终止整个
-流程；如果只想忽略特定错误，可以传入接收 `PDFError` 并返回布尔值的判断函数。忽略错误会
+从 `pdf_craft` 导入 `ErrorPolicy`，通过门面或单次操作的
+`error_policy=ErrorPolicy(ignore_pdf_render_errors=True)` 可以让可恢复的单页渲染错误不立即终止整个
+流程；如果只想忽略特定错误，该字段可传入接收 `FailureContext` 并返回布尔值的判断函数。忽略错误会
 留下缺失或 fallback 页面，适合抢救长文档，不代表原始页面已经被正确识别。
 
-OCR 也有对应的 `ignore_ocr_errors` 选项，既可以设为 `True`，也可以传入接收 `OCRError`
-的判断函数。它只控制遇到识别错误时是否继续处理后续页面；被跳过的页面仍可能没有可用文字，
-因此应在输出中检查这些页面，而不是把“流程完成”当成“每页都识别成功”。
+OCR 也有对应的 `ErrorPolicy.ignore_ocr_errors` 字段，既可以设为 `True`，也可以传入接收
+`FailureContext` 的判断函数，从中读取来源页及结构化错误摘要。它控制遇到可恢复识别错误时是否继续处理后续页面；被跳过的页面仍可能没有可用文字，
+因此应在输出中检查这些页面，而不是把“流程完成”当成“每页都识别成功”。所有请求页都因错误
+退化为图片或占位时，任务仍会失败，不能由错误策略放行。详见[错误处理](ERROR_HANDLING.md)。
 
 ## local OCR 问题
 
@@ -114,9 +125,9 @@ preset：
   这个预算中扣除；`max_ocr_output_tokens` 则只累计限制输出 token。预算在进入下一页前耗尽
   时，提取会以 `TokenLimitError` 中断，而不是继续处理剩余页面。此时先记录异常和已发出的
   OCR 事件，再减少 `page_indexes` 或提高相应上限；提高上限也会增加供应商费用或本地显存压力。
-- `includes_cover=True` 才会把识别到的封面图写入 package；`includes_footnotes=True` 才会
-  请求并保留脚注内容。遇到“正文有了但封面或脚注缺失”时，先检查这两个选项，而不是重复
-  下载模型或更换 OCR backend。
+- `includes_cover=True` 才会把识别到的封面图写入 extraction；脚注则应配置
+  `footnotes=FootnoteOptions()`，需要 JEV + LLM 矫正时再加入 `FootnoteRefinement`。
+  遇到“正文有了但封面或脚注缺失”时，先检查这些选项，而不是重复下载模型或更换 OCR backend。
 
 ### 目录识别或输出结构异常
 
@@ -124,23 +135,15 @@ preset：
 预期。需要用 LLM 分析目录时传入 `toc_llm`，并检查它的 endpoint、模型和凭据。目录分析失败
 时，先关闭 `toc_assumed` 或缩小 `page_indexes` 验证目录页，再处理 OCR 本身的问题。
 
-`generate_plot=True` 会额外生成图表相关资源并写入 package 的 `plots` 目录；输出体积突然
+`generate_plot=True` 会额外生成分析图并写入 analysis 的 `plots` 目录；这些诊断信息不进入 `.pcex`。输出体积突然
 变大或目录中出现额外资源时，这是预期行为。若磁盘空间不足，先关闭该选项。
 
-### 用 OCR 事件定位具体页面
+### 用进度事件定位具体页面
 
-需要判断任务卡在哪一页时，可通过 `on_ocr_event` 注册回调，记录每个 `OCREvent` 的
-`page_index`、`total_pages`、`kind`、耗时以及 `input_tokens`/`output_tokens`。常见事件包括：
-
-- `START`：开始处理一个页面；
-- `RENDERED`：页面已渲染成图像，尚未完成 OCR；
-- `COMPLETE`：页面识别完成；
-- `FAILED`：页面识别失败，`error` 字段包含异常；
-- `SKIP`：页面已有缓存结果而跳过 OCR；`IGNORE`：页面不在 `page_indexes` 范围内而不执行识别。
-
-把这些事件与失败页面的 PDF 页码、异常消息一起记录，能快速区分“没有选中该页”“渲染失败”
-和“OCR 服务失败”。`COMPLETE` 事件中的 token 字段也可用来核对计量是否异常；事件回调只
-用于观测，不会自动修复失败页面。
+使用 `ExtractionOptions.on_extraction_event`，记录 `unit_id`、`unit_kind`、`page_index`、
+`stage` 和最终 `outcome`。OCR 页完成不等于提取完成；页最终结果会在全局校验、恢复后确定。
+失败详情使用 ErrorPolicy，token 总量使用 metered 返回值。
+完整字段和整数 stage 说明见[统一进度协议](TRANSLATION_PROGRESS.md)。
 
 ### 处理过程中被中断
 
@@ -192,10 +195,7 @@ base URL，模型名是否可用，token encoding 是否与模型匹配。确认
 
 ### 翻译结果为空或 XML 修复失败
 
-EPUB 翻译要求 LLM 返回完整、可解析的结构化结果。使用 `on_fill_failed` 接收
-`FillFailedEvent`，并重点关注 `over_maximum_retries=True` 的事件；这表示该结构修复已经超过
-最大重试次数，可能影响最终 EPUB。降低并发、缩短自定义提示词或更换结构化输出更稳定的模型，
-通常比盲目增加重试更有效。
+失败决策与重试配置见 [错误处理](ERROR_HANDLING.md)。
 
 ### 缓存命中旧结果或无法恢复
 
@@ -205,8 +205,9 @@ EPUB 翻译要求 LLM 返回完整、可解析的结构化结果。使用 `on_fi
 
 ## 输出文件和临时目录问题
 
-`convert_pdf_to_markdown` 与 `convert_pdf_to_epub` 未传入 `package_path` 时，会创建系统临时工作
-目录，并在成功或异常后清理。需要调试中间结果时，显式传入一个可写的 `package_path`；该目录
+`convert_pdf_to_markdown` 与 `convert_pdf_to_epub` 默认创建系统临时 analysis 目录，并在成功或
+异常后清理。需要调试时传入可写的 `analysing_path`；需要复用中间结果时传入 `.pcex`
+`extraction_path`。后端不接受普通目录；调用方提供的 analysis 和 `.pcex`
 由调用者负责管理，不会自动删除。
 
 如果最终输出没有生成，先确认输出路径的父目录存在且可写，并检查异常是否发生在 OCR、翻译或
@@ -224,8 +225,15 @@ PDF 翻译写回需要原始 PDF 和与它匹配的提取结果。写回阶段�
 - 中间结果来自另一份输入文件；
 - 翻译文本无法放入原始文字区域。
 
-先确认原始 PDF 没有被替换，并使用同一份输入文件完成提取、翻译和写回。PDF 写回只支持
-替换式提交；`APPEND_BLOCK` 适用于 Markdown/EPUB 等结构化输出，不适用于 PDF 页面写回。
+先确认原始 PDF 没有被替换，并使用同一份输入文件完成提取、翻译和写回。PDF 写回需要 Ghostscript：
+它会将源页的非 Annotation 内容编译为无字体的视觉底图，使原文字与隐藏 OCR 文字不会干扰选择、搜索
+或提取。Qt 层是唯一普通可选择的译文文字；原 `/Annots` 数组会在其上重新挂载，链接、高亮、批注和
+表单等仍可交互。擦除使用带 padding 的局部 RGB 背景色，而不恢复纹理。PDF 写回只支持替换式提交；
+`APPEND_BLOCK` 适用于 Markdown/EPUB 等结构化输出，不适用于 PDF 页面写回。
+
+行内公式默认会在 Matplotlib 和本机 TeX 同时可用时绘制为 PDF 矢量内容。任一可选运行时缺失或某一个
+公式绘制失败时，会有意降级为可读的 plain text，不会使整份 PDF 失败。若想主动选择这一行为，可设置
+`PatchTextOptions(render_inline_formulas=False)`。
 
 ## 仍然无法定位时
 
@@ -236,6 +244,9 @@ PDF 翻译写回需要原始 PDF 和与它匹配的提取结果。写回阶段�
 - 是否使用 CUDA、`torch.cuda.is_available()` 的结果和 GPU 型号；
 - 输入 PDF/EPUB 的页数或章节数，以及失败发生在哪一步；
 - 完整异常类型和消息（删除 API key、token、文件内容等敏感信息）；
-- 是否使用显式 `package_path`、`models_cache_path` 或 LLM `cache_path`。
+- 是否使用显式 `analysing_path`、`extraction_path`、`models_cache_path` 或 LLM `cache_path`。
 
 不要把真实密钥、完整 PDF、模型缓存或生成日志直接提交到代码仓库。
+
+
+统一策略、默认严格失败和全局全部降级的规则见 [错误处理](ERROR_HANDLING.md)。

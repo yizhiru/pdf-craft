@@ -37,16 +37,22 @@ craft = PDFCraft(pdf=PDFOptions(ocr=DeepSeekOCRLocalConfig(
 DeepSeek vendor configurations take `base_url`, `api_key`, and `model`; they also accept `temperature`, `top_p`, `max_tokens` (default `8000`), and `timeout_seconds` (default `180`).
 
 ```python
-from pdf_craft import DeepSeekOCRVendorConfig, PDFCraft, PDFOptions
+from pdf_craft import (
+    ConcurrentExecutor, DeepSeekOCRVendorConfig, FixedCapacity,
+    PDFCraft, PDFOptions,
+)
 
-craft = PDFCraft(pdf=PDFOptions(ocr=DeepSeekOCRVendorConfig(
-    base_url="https://example.com/v1",
-    api_key="your-api-key",
-    model="deepseek-ocr",
-)))
+craft = PDFCraft(pdf=PDFOptions(
+    ocr=DeepSeekOCRVendorConfig(
+        base_url="https://example.com/v1",
+        api_key="your-api-key",
+        model="deepseek-ocr",
+    ),
+    ocr_executor=ConcurrentExecutor(FixedCapacity(8)),
+))
 ```
 
-`UnlimitedOCRVendorConfig` takes Baidu `ak` and `sk`; its `base_url` defaults to `https://aip.baidubce.com`. It also accepts `poll_interval_seconds` and `timeout_seconds`.
+`UnlimitedOCRVendorConfig` takes Baidu `ak` and `sk`; its `base_url` defaults to `https://aip.baidubce.com`. It also accepts `poll_interval_seconds`, `timeout_seconds`, `retry_times`, and `retry_interval_seconds`. The DeepSeek vendor configurations expose the same retry controls.
 
 ```python
 from pdf_craft import UnlimitedOCRVendorConfig
@@ -54,8 +60,73 @@ from pdf_craft import UnlimitedOCRVendorConfig
 ocr = UnlimitedOCRVendorConfig(ak="your-access-key", sk="your-secret-key")
 ```
 
+### Supplying image URLs
+
+By default, Vendor OCR reads each rendered PNG and sends it as a Base64 Data URL. Applications
+whose provider accepts or requires remote image URLs can supply an `OCRImageURLResolver`. The
+resolver receives the rendered image `Path` and returns either an HTTP(S) URL or a Base64 image
+Data URL:
+
+```python
+from pathlib import Path
+
+from pdf_craft import (
+    ConcurrentExecutor, DeepSeekOCRVendorConfig, FixedCapacity,
+    OCRImageURLResolver, PDFCraft, PDFOptions,
+)
+
+async def resolve_ocr_image(path: Path) -> str:
+    return await image_service.create_url(path)
+
+resolver: OCRImageURLResolver = resolve_ocr_image
+craft = PDFCraft(pdf=PDFOptions(
+    ocr=DeepSeekOCRVendorConfig(
+        base_url="https://example.com/v1",
+        api_key="your-api-key",
+        model="deepseek-ocr",
+    ),
+    ocr_executor=ConcurrentExecutor(FixedCapacity(8)),
+    ocr_image_url_resolver=resolver,
+))
+```
+
+The resolver is asynchronous and runs on the caller's event loop. Each logical OCR image is
+resolved lazily once, and its URL is reused across transport retries. A
+second-stage footnote image is a separate logical image and is resolved independently.
+
+DeepSeek OCR sends the returned value through `image_url.url`. Unlimited OCR sends Base64 Data
+URLs through `file_data` and HTTP(S) URLs through `file_url`. Uploading, signing, expiry,
+cleanup, caching, and storage-specific concurrency belong to the application that provides the
+resolver.
+
 ## Convenience defaults
 
 When `PDFOptions` has no explicit `ocr`, `models_cache_path` and `local_only` configure the default local DeepSeek OCR setup. Do not combine either convenience field with an explicit `ocr` configuration; that is rejected because the ownership of those settings would be ambiguous.
 
 OCR recognizes pages only. Text translation uses a separate LLM configuration; see the PDF and EPUB guides.
+
+Vendor OCR renders PDF pages serially, then submits only the remote OCR operations through
+`ocr_executor`. Skipped pages and ignored failures are terminal page outcomes and do not hold up
+the remaining extraction pipeline. When either cumulative OCR token budget is set, vendor requests
+settle one page at a time so the next request receives the exact remaining budget.
+
+Retries release `ocr_executor` capacity before waiting and reacquire it for every HTTP attempt.
+Unlimited OCR token acquisition, task submission, each poll, and result download are separate
+remote operations; poll intervals therefore do not occupy a provider slot, and retrying a poll or
+download does not submit the page again. Expired access tokens are refreshed before retrying the
+current operation, while a provider task-processing failure resubmits that page. HTTP 429 is
+retried as rate limiting unless the provider body reports exhausted quota. Payment, exhausted
+quota, and authentication or permission failures close the shared executor; other page failures
+remain eligible for `ErrorPolicy.ignore_ocr_errors`. This also applies when an Unlimited OCR query reports a
+failed task whose `task_error` says the quota is insufficient. The resulting
+`OCRError` keeps the original provider exception and HTTP response in its exception cause chain.
+
+
+See [error handling](ERROR_HANDLING.md) for strict defaults, source locations and task-wide all-fallback protection.
+
+Temporary limits now use the executor's `RateLimitScope`, independently of vendor
+`retry_times` and `retry_interval_seconds`, which retain their non-rate recovery roles.
+See [shared rate-limit scopes](API_REFERENCE.md#shared-rate-limit-scopes).
+
+Model service calls also support operation-level `request_headers`; see
+[scope and resource-download boundaries](API_REFERENCE.md#operation-request-headers).

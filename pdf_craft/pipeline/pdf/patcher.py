@@ -1,38 +1,55 @@
-from dataclasses import dataclass
+# pylint: disable=unused-argument
+"""Compose non-interactive visual bases with independent overlays."""
+
+from pdf_craft.usage import UsageCollector
+from pdf_craft.pdf.backend import pdf_backend_scope, poppler_path_for, current_poppler_path
+from pdf_craft.policies import RetryPolicy, ErrorPolicyInput
+from pdf_craft._policy import OMITTED, policy_operation
+# Native worker adapters share patcher state within this module.
+# pylint: disable=protected-access
+
+from collections.abc import Iterable, Mapping
+from copy import copy
+from io import BytesIO
+import logging
 from pathlib import Path
+import pickle
+import shutil
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import Iterable
+from typing import Any
 
-from pdf_craft.pdf.handler import DefaultPDFHandler, PDFHandler
+from pdf_craft.pdf.handler import (
+    AsyncPDFHandler, DefaultPDFHandler, PDFHandler, _materialize_pdf_handler,
+)
+from pdf_craft.formula import latex_to_plain_text
+from pdf_craft.error import NoUsableFillPagesError
 
-from .text_layout import BoxTextLayout, PatchTextOptions
+from ...runtime import IO_DOMAIN, QT_DOMAIN, temporary_directory
+
+from .error_policy import _process_error_policy_checker
+from .eraser import EraseOptions, EraseRectangle, RectangularEraser
+from .models import PDFReplacement, PDFReplacementRegion
+from .feed import ReplacementFeed
+from .text_layout import (
+    FontResolution, PatchTextOptions, QTextParagraphFiller, WindowedParagraphPlanner, _contains_cjk,
+)
 
 
-@dataclass(frozen=True)
-class PDFReplacement:
-    page_index: int
-    bbox: tuple[int, int, int, int]
-    text: str
-    page_pixel_size: tuple[int, int]
-    dpi: int = 300
-    reading_order: int = 0
-
-
-@dataclass(frozen=True)
-class PDFSkippedReplacement:
-    """An explicitly skipped overflow, retained for callers to inspect."""
-
-    page_index: int
-    bbox: tuple[int, int, int, int]
-    reason: str
+_LOGGER = logging.getLogger(__name__)
+from .visual_base import (
+    GhostscriptVisualBaseCompiler, extract_annotations, reattach_annotations,
+    VisualBaseCompiler, write_annotation_free_copy,
+)
 
 
 class PDFPatcher:
-    """Replace OCR-backed text regions in a PDF with translated text.
+    """Replace OCR-backed regions over a non-interactive source visual base.
 
-    The implementation uses pypdf for page preservation and reportlab for a
-    transparent overlay. Both imports are lazy so normal OCR/Markdown users do
-    not need the patching stack at import time.
+    The eraser owns a locally sampled background-color rectangle overlay and
+    the filler owns a separate Qt-generated PDF text overlay.  The original
+    page is first compiled to a font-free visual base. Interactive Annotation
+    objects are restored only after both overlays are complete, while full-page
+    visual Stamps are flattened below them.
     """
 
     def __init__(
@@ -40,13 +57,19 @@ class PDFPatcher:
         font_name: str | None = None,
         font_size: float | None = None,
         options: PatchTextOptions | None = None,
-        pdf_handler: PDFHandler | None = None,
+        pdf_handler: AsyncPDFHandler | None = None,
         dpi: int = 300,
+        erase_options: EraseOptions | None = None,
+        visual_base_compiler: VisualBaseCompiler | None = None,
+        *, _native_pdf_handler: PDFHandler | None = None,
     ) -> None:
         """Create a patcher.
 
-        ``font_name`` and ``font_size`` remain accepted for compatibility. A
-        supplied font size is the maximum fitted size, not a forced size.
+        ``pdf_handler`` renders source pages only to sample local background
+        colors for erasure. ``visual_base_compiler`` is responsible for
+        removing the source page's interactive text semantics while preserving
+        its visual content.  It defaults to Ghostscript's local ``pdfwrite``
+        executable.
         """
         if options is not None and (font_name is not None or font_size is not None):
             raise ValueError("pass either options or legacy font_name/font_size arguments")
@@ -61,115 +84,631 @@ class PDFPatcher:
                 ),
             )
         self.options = options
-        self._layout = BoxTextLayout(options)
-        self._pdf_handler = pdf_handler or DefaultPDFHandler()
+        self._eraser = RectangularEraser(erase_options)
+        self._filler = QTextParagraphFiller(options)
+        self._async_pdf_handler = pdf_handler
+        self._pdf_handler = _native_pdf_handler or DefaultPDFHandler()
+        self._visual_base_compiler = visual_base_compiler or GhostscriptVisualBaseCompiler()
         self.dpi = dpi
-        self.skipped_replacements: tuple[PDFSkippedReplacement, ...] = ()
+        self._preserved_source_pages: set[int] = set()
+        self._stream_pages: dict[int, int] = {}
+        self._preview_path: Path | None = None
+        self._replacement_feed: ReplacementFeed | None = None
+        self._failed_page_indexes: tuple[int, ...] = ()
+        self._font_resolutions: tuple[FontResolution, ...] = ()
 
-    def patch(self, source_path: Path, target_path: Path, replacements: Iterable[PDFReplacement]) -> None:
+    def _backend_poppler_path(self) -> Path | None:
+        """Share the native adapter's tool configuration with nested readers."""
+        return poppler_path_for(self._pdf_handler)
+
+    @property
+    def font_resolutions(self) -> tuple[FontResolution, ...]:
+        """Qt font choices made during the most recent :meth:`patch` run."""
+        return self._font_resolutions
+
+    @property
+    def failed_page_indexes(self) -> tuple[int, ...]:
+        """Pages retained as visual bases during the most recent patch run."""
+        return self._failed_page_indexes
+
+    @policy_operation
+    @pdf_backend_scope
+    async def patch(
+        self,
+        source_path: Path,
+        target_path: Path,
+        replacements: Iterable[PDFReplacement],
+        *,
+        document_metadata: Mapping[str, str] | None = None,
+        retry_policy: RetryPolicy | None = None, error_policy: ErrorPolicyInput = OMITTED,
+        request_headers: Mapping[str, str] | None = None,
+        usage: UsageCollector | None = None,
+    ) -> None:
+        """Prepare and compile asynchronously, then isolate native Qt composition."""
+        async with _process_error_policy_checker(error_policy) as worker_checker:
+            if isinstance(replacements, ReplacementFeed):
+                has_replacements = await IO_DOMAIN.run(lambda: next(iter(replacements), None) is not None)
+            else:
+                replacements = await IO_DOMAIN.run(tuple, replacements)
+                has_replacements = bool(replacements)
+            async with temporary_directory("pdf-craft-patch-") as root:
+                visual_base = None
+                if has_replacements:
+                    annotation_free = root / "annotation-free.pdf"
+                    visual_base = root / "visual-base.pdf"
+                    await IO_DOMAIN.run(_write_visual_source, source_path, annotation_free)
+                    await self._visual_base_compiler.compile(annotation_free, visual_base)
+                native = copy(self)
+                # ContextVars do not cross the isolated Qt process boundary.
+                # Freeze the inherited tool installation into its native reader.
+                if isinstance(native._pdf_handler, DefaultPDFHandler):
+                    native._pdf_handler = DefaultPDFHandler(
+                        native._pdf_handler.poppler_path or current_poppler_path(),
+                    )
+                # Caller-owned async handlers/compilers never cross the process boundary.
+                native._async_pdf_handler = None
+                if isinstance(replacements, ReplacementFeed):
+                    native._replacement_feed = replacements
+                del native._visual_base_compiler
+                if has_replacements and self._async_pdf_handler is not None:
+                    native._pdf_handler = await _materialize_pdf_handler(
+                        self._async_pdf_handler, source_path,
+                        set(self._stream_pages) if isinstance(replacements, ReplacementFeed) else
+                        {region.page_index for replacement in replacements for region in replacement.source_regions()},
+                        self._stream_pages if isinstance(replacements, ReplacementFeed) else
+                        {region.page_index: region.dpi for replacement in replacements for region in replacement.source_regions()}, root,
+                    )
+                resolutions, failed_pages = await QT_DOMAIN.run(
+                    _compose_pdf, native, source_path, target_path, replacements,
+                    worker_checker, dict(document_metadata or {}), visual_base,
+                )
+                self._font_resolutions = resolutions
+                self._failed_page_indexes = failed_pages
+
+    def _compose(
+        self,
+        source_path: Path,
+        target_path: Path,
+        replacements: Iterable[PDFReplacement],
+        *,
+        error_policy: ErrorPolicyInput = OMITTED,
+        document_metadata: Mapping[str, str] | None = None,
+        visual_base_path: Path | None = None,
+    ) -> None:
+        """Compose visual bases, rectangular erasure, Qt text, then Annotations.
+
+        ``document_metadata`` augments the output PDF's document-information
+        dictionary.  It is supplied by the PCEX pipeline, not inferred from
+        visual source pages.
+        """
         try:
             import pypdf
-            from reportlab.lib.utils import ImageReader
             from reportlab.pdfgen import canvas
-        except ImportError as error:
-            raise RuntimeError("PDF patching requires the optional 'reportlab' dependency") from error
+        except ImportError as error:  # pragma: no cover - declared dependencies.
+            raise RuntimeError("PDF patching requires pypdf and reportlab") from error
 
-        reader = pypdf.PdfReader(str(source_path))
-        skipped: list[PDFSkippedReplacement] = []
-        replacements_by_page: dict[int, list[PDFReplacement]] = {}
-        for replacement in replacements:
-            self.validate(replacement, pages_count=len(reader.pages))
-            replacements_by_page.setdefault(replacement.page_index, []).append(replacement)
-        for page_replacements in replacements_by_page.values():
-            page_replacements.sort(key=lambda replacement: replacement.reading_order)
-
-        # Preflight all pages before drawing any white rectangles or creating a
-        # target file. A failed fit must not masquerade as a successful patch.
-        layouts: dict[int, list[tuple[PDFReplacement, object]]] = {}
-        for index, page in enumerate(reader.pages, 1):
-            width = float(page.mediabox.width)
-            height = float(page.mediabox.height)
-            for replacement in replacements_by_page.get(index, []):
-                try:
-                    fitted = self._fit_replacement(replacement, width, height)
-                except ValueError as error:
-                    if self.options.overflow == "skip":
-                        skipped.append(PDFSkippedReplacement(index, replacement.bbox, str(error)))
-                        continue
-                    raise ValueError(
-                        f"page {index}, bbox {replacement.bbox}: {error}"
-                    ) from error
-                layouts.setdefault(index, []).append((replacement, fitted))
-
-        writer = pypdf.PdfWriter()
-        document = self._pdf_handler.open(source_path)
+        reset_font_resolutions = getattr(self._filler, "reset_font_resolutions", None)
+        if reset_font_resolutions is not None:
+            reset_font_resolutions()
+        self._failed_page_indexes = ()
+        document_metadata = dict(document_metadata or {})
+        replacements = iter(replacements)
         try:
-            for index, page in enumerate(reader.pages, 1):
-                width = float(page.mediabox.width)
-                height = float(page.mediabox.height)
-                with TemporaryDirectory() as temp_dir:
-                    overlay_path = Path(temp_dir) / "overlay.pdf"
-                    overlay = canvas.Canvas(str(overlay_path), pagesize=(width, height))
-                    page_layouts = layouts.get(index, [])
-                    render_dpi = page_layouts[0][0].dpi if page_layouts else self.dpi
-                    raw_page = document.render_page(index, render_dpi)
-                    overlay.drawImage(ImageReader(raw_page), 0, 0, width=width, height=height)
-                    for replacement, _ in page_layouts:
-                        self._draw_background(overlay, replacement, width, height)
-                    for replacement, fitted in page_layouts:
-                        self._draw_text(overlay, replacement, fitted, width, height)
-                    overlay.save()
-                    overlay_reader = pypdf.PdfReader(str(overlay_path))
-                    writer.add_page(overlay_reader.pages[0])
-        finally:
-            document.close()
+            first_replacement = next(replacements)
+        except StopIteration:
+            # A pcex without translated coverage is an identity operation.
+            # Do not run Ghostscript or reconstruct its pages: copying keeps
+            # all source fidelity and interaction exactly intact.
+            if not document_metadata:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_path, target_path)
+                return
+            source_reader = pypdf.PdfReader(str(source_path))
+            writer = pypdf.PdfWriter(clone_from=source_reader)
+            writer.add_metadata(document_metadata)
+            self._write_output(writer, target_path)
+            return
+        feed = getattr(self, '_replacement_feed', None)
+        replacements = feed if feed is not None else _prepend(first_replacement, replacements)
+        source_reader = pypdf.PdfReader(str(source_path))
+        page_sizes = {
+            index: (float(page.mediabox.width), float(page.mediabox.height))
+            for index, page in enumerate(source_reader.pages, 1)
+        }
+        annotations_by_page = extract_annotations(source_reader)
+        writer = pypdf.PdfWriter()
+        source_metadata = _source_document_metadata(source_reader)
+        if source_metadata:
+            writer.add_metadata(source_metadata)
+        if document_metadata:
+            writer.add_metadata(document_metadata)
+        next_page_index = 1
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            assert visual_base_path is not None
+            reader = pypdf.PdfReader(str(visual_base_path))
+            self._restore_source_page_geometry(source_reader, reader)
+            self._validate_visual_base(reader, page_sizes)
+            replacements_path = root / "replacements.pickle"
+            has_automatic_font = False
+            contains_cjk = False
+            target_page_indexes: set[int] = set()
+            primary_targets: set[tuple[int, ...]] = set()
 
+            def record_targets(replacement, pages):
+                target_page_indexes.update(pages)
+                if replacement.layout_ref not in {'heading', 'furniture', 'header', 'footer', 'title', 'sub_title'}:
+                    primary_targets.add(tuple(pages))
+            failed_page_indexes: set[int] = set(self._preserved_source_pages)
+            patched_page_indexes: set[int] = set()
+
+            def record_page_failure(page_index: int, error: Exception) -> None:
+                failed_page_indexes.add(page_index)
+                _LOGGER.error(
+                    "PDF fill failed for page %s; preserving its visual base", page_index,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+            def record_replacement_failure(replacement: PDFReplacement, error: Exception) -> None:
+                pages = _replacement_pages_in_source(replacement, len(source_reader.pages))
+                if not pages:
+                    raise error
+                for page_index in pages:
+                    target_page_indexes.add(page_index)
+                    record_page_failure(page_index, error)
+
+            streaming = isinstance(replacements, ReplacementFeed)
+            def validated(values):
+                for replacement in values:
+                    try:
+                        pages = _replacement_pages_in_source(replacement, len(source_reader.pages))
+                        record_targets(replacement, pages)
+                        if self._preserved_source_pages.intersection(pages):
+                            if self._preview_path is not None and getattr(replacement, 'preview_index', -1) >= 0:
+                                from .feed import write_record
+                                write_record(self._preview_path / str(replacement.preview_index), None)
+                            continue
+                        self.validate(replacement, pages_count=len(source_reader.pages))
+                        yield replacement
+                    except Exception as error:
+                        if not _check_ignore_error(error_policy, error, replacement=replacement, stage="replacement_validation"):
+                            raise
+                        record_replacement_failure(replacement, error)
+            if streaming:
+                # A font with CJK coverage also covers Latin text; no text prepass.
+                has_automatic_font = True
+                contains_cjk = True
+            else:
+                with replacements_path.open("wb") as stream:
+                    for replacement in replacements:
+                        try:
+                            pages = _replacement_pages_in_source(replacement, len(source_reader.pages))
+                            record_targets(replacement, pages)
+                            if self._preserved_source_pages.intersection(pages):
+                                continue
+                            self.validate(replacement, pages_count=len(source_reader.pages))
+                            style = self.options.style_for(
+                                replacement.layout_ref, replacement.layout_level,
+                            )
+                            if not style.font_name or not style.font_name.strip():
+                                has_automatic_font = True
+                                contains_cjk = contains_cjk or _contains_cjk(replacement.text)
+                            pickle.dump(replacement, stream, protocol=pickle.HIGHEST_PROTOCOL)
+                        except Exception as error:
+                            if not _check_ignore_error(error_policy, error, replacement=replacement, stage="replacement_validation"):
+                                raise
+                            record_replacement_failure(replacement, error)
+            if has_automatic_font:
+                prepare_automatic_font = getattr(self._filler, "prepare_automatic_font", None)
+                if prepare_automatic_font is not None:
+                    try:
+                        prepare_automatic_font(contains_cjk)
+                    except Exception as error:
+                        if not _check_ignore_error(error_policy, error, page_indexes=target_page_indexes, stage="font_prepare"):
+                            raise
+                        for page_index in target_page_indexes:
+                            record_page_failure(page_index, error)
+
+            def spooled_replacements():
+                with replacements_path.open("rb") as stream:
+                    while True:
+                        try:
+                            yield pickle.load(stream)
+                        except EOFError:
+                            return
+
+            def on_window_error(window_replacements: tuple[PDFReplacement, ...], error: Exception) -> None:
+                if not _check_ignore_error(error_policy, error, replacements=window_replacements, stage="paragraph_layout"):
+                    raise error
+                for replacement in window_replacements:
+                    record_replacement_failure(replacement, error)
+
+            planner = WindowedParagraphPlanner(self._filler, page_sizes, self.options)
+            for window in planner.plan(validated(replacements) if streaming else spooled_replacements(), on_window_error=on_window_error):
+                for index in range(next_page_index, window.first_page_index):
+                    writer.add_page(source_reader.pages[index - 1])
+                self._compose_window(
+                    pypdf, canvas, source_path, source_reader, reader, writer, root,
+                    page_sizes, window, target_page_indexes, error_policy, failed_page_indexes,
+                    patched_page_indexes, record_page_failure,
+                )
+                next_page_index = window.last_page_index + 1
+            for index in range(next_page_index, len(reader.pages) + 1):
+                writer.add_page(source_reader.pages[index - 1])
+            self._failed_page_indexes = tuple(sorted(failed_page_indexes))
+            # A paragraph is accepted only if all of its pages survived. Small
+            # auxiliary successes must never conceal total primary failure.
+            primary_failed = bool(primary_targets) and not any(
+                pages and all(page in patched_page_indexes and page not in failed_page_indexes for page in pages)
+                for pages in primary_targets
+            )
+            if primary_failed or (target_page_indexes and target_page_indexes.issubset(failed_page_indexes)):
+                failed_targets = (
+                    {page for pages in primary_targets for page in pages if page in failed_page_indexes}
+                    if primary_failed else target_page_indexes
+                )
+                raise NoUsableFillPagesError(tuple(sorted(failed_targets)))
+            source_catalog: Any = source_reader.trailer["/Root"]
+            reattach_annotations(
+                writer,
+                annotations_by_page,
+                (page.indirect_reference for page in source_reader.pages),
+                source_catalog.get("/AcroForm"),
+                source_reader.named_destinations,
+                page_indexes=patched_page_indexes,
+            )
+            self._write_output(writer, target_path)
+
+    @staticmethod
+    def _write_output(writer, target_path: Path) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile(dir=target_path.parent, suffix=".pdf", delete=False) as output:
             temporary_path = Path(output.name)
             writer.write(output)
         temporary_path.replace(target_path)
-        self.skipped_replacements = tuple(skipped)
-
-    def validate(self, replacement: PDFReplacement, pages_count: int | None = None) -> None:
-        left, top, right, bottom = replacement.bbox
-        if replacement.page_index < 1:
-            raise ValueError("page_index must be positive")
-        if pages_count is not None and replacement.page_index > pages_count:
-            raise ValueError(f"page_index {replacement.page_index} exceeds source page count {pages_count}")
-        if left < 0 or top < 0 or right <= left or bottom <= top:
-            raise ValueError(f"invalid bbox: {replacement.bbox}")
-        if not replacement.text.strip():
-            raise ValueError("replacement text must not be empty")
-        if replacement.page_pixel_size[0] <= 0 or replacement.page_pixel_size[1] <= 0:
-            raise ValueError("page_pixel_size must be positive")
-        if right > replacement.page_pixel_size[0] or bottom > replacement.page_pixel_size[1]:
-            raise ValueError("bbox exceeds page_pixel_size")
-
-    def _fit_replacement(self, replacement: PDFReplacement, width: float, height: float):
-        _, _, box_width, box_height = self._box_in_points(replacement, width, height)
-        return self._layout.fit(replacement.text, box_width, box_height)
 
     @staticmethod
-    def _box_in_points(replacement: PDFReplacement, width: float, height: float) -> tuple[float, float, float, float]:
-        pixel_width, pixel_height = replacement.page_pixel_size
-        left, top, right, bottom = replacement.bbox
-        scale_x = width / pixel_width
-        scale_y = height / pixel_height
-        x = left * scale_x
-        y = height - bottom * scale_y
-        return x, y, (right - left) * scale_x, (bottom - top) * scale_y
+    def _restore_source_page_geometry(source_reader, visual_reader) -> None:
+        """Restore exact page boxes after Ghostscript's decimal rounding.
 
-    def _draw_background(self, overlay, replacement: PDFReplacement, width: float, height: float) -> None:
-        x, y, box_width, box_height = self._box_in_points(replacement, width, height)
-        overlay.setFillColorRGB(1, 1, 1)
-        overlay.rect(x, y, box_width, box_height, stroke=0, fill=1)
+        Ghostscript can round a MediaBox while retaining the original CropBox.
+        The tiny difference still matters because OCR coordinates are converted
+        against the source page dimensions, so copy the source page geometry
+        onto the visual base before it receives any overlay.
+        """
+        if len(source_reader.pages) != len(visual_reader.pages):
+            return
+        for source_page, visual_page in zip(source_reader.pages, visual_reader.pages, strict=True):
+            visual_page.mediabox = source_page.mediabox
+            visual_page.cropbox = source_page.cropbox
+            visual_page.bleedbox = source_page.bleedbox
+            visual_page.trimbox = source_page.trimbox
+            visual_page.artbox = source_page.artbox
+            visual_page.rotation = source_page.rotation
 
-    def _draw_text(self, overlay, replacement: PDFReplacement, fitted, width: float, height: float) -> None:
-        x, y, _, box_height = self._box_in_points(replacement, width, height)
-        overlay.setFillColorRGB(0, 0, 0)
-        fitted.paragraph.drawOn(
-            overlay,
-            x + self.options.horizontal_padding,
-            y + box_height - self.options.vertical_padding - fitted.height,
-        )
+    @staticmethod
+    def _validate_visual_base(reader, page_sizes: dict[int, tuple[float, float]]) -> None:
+        """Reject a broken external conversion before any output is written."""
+        if len(reader.pages) != len(page_sizes):
+            raise RuntimeError("Ghostscript visual base page count differs from the source PDF")
+        for index, page in enumerate(reader.pages, 1):
+            width, height = float(page.mediabox.width), float(page.mediabox.height)
+            source_width, source_height = page_sizes[index]
+            if (width, height) != (source_width, source_height):
+                raise RuntimeError(
+                    f"Ghostscript visual base page {index} size differs from the source PDF"
+                )
+
+    def _compose_window(
+        self, pypdf, canvas, source_path: Path, source_reader, reader, writer, root: Path,
+        page_sizes: dict[int, tuple[float, float]], window, target_page_indexes: set[int],
+        error_policy: ErrorPolicyInput,
+        failed_page_indexes: set[int],
+        patched_page_indexes: set[int],
+        record_page_failure,
+    ) -> None:
+        """Compose one window while loading one serialized page plan at a time."""
+        document = None
+        preview = None
+        if getattr(self, '_preview_path', None) is not None:
+            from .preview import WindowPreview
+            preview = WindowPreview(root, window, self._filler, page_sizes)
+        try:
+            for index in range(window.first_page_index, window.last_page_index + 1):
+                if index not in target_page_indexes:
+                    writer.add_page(source_reader.pages[index - 1])
+                    continue
+                if index in failed_page_indexes:
+                    writer.add_page(source_reader.pages[index - 1])
+                    continue
+                try:
+                    page = reader.pages[index - 1]
+                    page_width, page_height = page_sizes[index]
+                    contributions = tuple(window.page_contributions(index))
+                    page_regions = tuple(
+                        region
+                        for contribution in contributions
+                        for region in contribution.regions
+                    )
+                    if page_regions and document is None:
+                        document = self._pdf_handler.open(source_path)
+                    page_erasures = self._plan_page_erasures(
+                        document, index, page_regions, page_sizes,
+                    )
+                    if page_erasures:
+                        erasure_path = root / f"erase-{index}.pdf"
+                        self._write_erasure_overlay(canvas, erasure_path, page_width, page_height, page_erasures)
+                        page.merge_page(pypdf.PdfReader(str(erasure_path)).pages[0])
+                    page_placements = tuple(
+                        placement
+                        for contribution in contributions
+                        for placement in contribution.placements
+                    )
+                    if page_placements:
+                        self._merge_text_placements(
+                            pypdf, page, root, index, (page_width, page_height), page_placements,
+                        )
+                        for placement in page_placements:
+                            for formula in placement.formula_draws:
+                                fragment = _formula_fragment_with_actual_text(pypdf, formula.pdf, formula.latex)
+                                page.merge_transformed_page(
+                                    fragment,
+                                    pypdf.Transformation().scale(
+                                        1 / formula.scale, 1 / formula.scale,
+                                    ).translate(
+                                        formula.x, page_height - formula.baseline - formula.descent,
+                                    ),
+                                )
+                    writer.add_page(page)
+                    patched_page_indexes.add(index)
+                    if preview is not None:
+                        preview.page(index, contributions, page_erasures)
+                except Exception as error:
+                    if not _check_ignore_error(error_policy, error, page_indexes=(index,), replacements=tuple(summary.replacement for summary in window._summaries
+                        if any(region.page_index == index for region in summary.replacement.source_regions())), stage="page_compose"):
+                        raise
+                    record_page_failure(index, error)
+                    writer.add_page(source_reader.pages[index - 1])
+            if preview is not None:
+                from .feed import write_record
+                assert self._preview_path is not None
+                for number, channel, content in preview.contents(failed_page_indexes):
+                    write_record(self._preview_path / str(number), (channel, content))
+        finally:
+            if preview is not None:
+                preview.close()
+            if document is not None:
+                document.close()
+            window.close()
+
+    def _merge_text_placements(
+        self,
+        pypdf,
+        page,
+        root: Path,
+        page_index: int,
+        page_size: tuple[float, float],
+        placements,
+    ) -> None:
+        """Merge Qt text while preserving forced text in Poppler extraction.
+
+        A forced placement is allowed below the physical page boundary, where
+        Poppler correctly omits ordinary visible glyphs.  Render it in its own
+        overlay and wrap that exact glyph stream in ``ActualText``: it remains
+        a genuine PDF text layer, visually unchanged, and extracts as the full
+        source string exactly once.  Ordinary contiguous placements stay in a
+        shared overlay to retain the normal fast path and stream order.
+        """
+        pending = []
+        overlay_index = 0
+
+        def merge(items, actual_text: str | None = None) -> None:
+            nonlocal overlay_index
+            if not items:
+                return
+            text_path = root / f"text-{page_index}-{overlay_index}.pdf"
+            overlay_index += 1
+            self._filler.draw_pdf_overlay(text_path, page_size, tuple(items))
+            text_page = pypdf.PdfReader(str(text_path)).pages[0]
+            if actual_text:
+                _set_page_actual_text(text_page, actual_text)
+            page.merge_page(text_page)
+
+        for placement in placements:
+            if not placement.force_written:
+                pending.append(placement)
+                continue
+            merge(pending)
+            pending = []
+            merge((placement,), placement.assigned_text or placement.remaining_text)
+        merge(pending)
+
+    def _plan_page_erasures(
+        self,
+        document,
+        page_index: int,
+        regions: Iterable[PDFReplacementRegion],
+        page_sizes: dict[int, tuple[float, float]],
+    ) -> tuple[EraseRectangle, ...]:
+        """Sample one source raster, plan that page's masks, then release it."""
+        page_regions = tuple(regions)
+        if not page_regions:
+            return ()
+        if document is None:  # Defensive: non-empty regions always opened it.
+            raise RuntimeError("source document is required for erasure")
+        dpi = page_regions[0].dpi
+        if any(region.dpi != dpi for region in page_regions[1:]):
+            raise ValueError(f"page {page_index} has incompatible erasure render DPI values")
+        page_image = document.render_page(page_index, dpi)
+        try:
+            return self._eraser.plan(page_regions, page_sizes, {page_index: page_image})
+        finally:
+            page_image.close()
+
+    def validate(self, replacement: PDFReplacement, pages_count: int | None = None) -> None:
+        if not replacement.text.strip():
+            raise ValueError("replacement text must not be empty")
+        regions = replacement.source_regions()
+        if replacement.regions and len(regions) == 1:
+            self._validate_single_region_matches_replacement(replacement, regions[0])
+        for region in regions:
+            self._validate_region(region, pages_count)
+
+    @staticmethod
+    def _validate_single_region_matches_replacement(
+        replacement: PDFReplacement, region: PDFReplacementRegion,
+    ) -> None:
+        if (
+            replacement.page_index != region.page_index
+            or replacement.bbox != region.bbox
+            or replacement.page_pixel_size != region.page_pixel_size
+            or replacement.dpi != region.dpi
+            or replacement.reading_order != region.reading_order
+        ):
+            raise ValueError("replacement geometry must match its only source region")
+
+    @staticmethod
+    def _validate_region(region: PDFReplacementRegion, pages_count: int | None = None) -> None:
+        left, top, right, bottom = region.bbox
+        if region.page_index < 1:
+            raise ValueError("page_index must be positive")
+        if pages_count is not None and region.page_index > pages_count:
+            raise ValueError(f"page_index {region.page_index} exceeds source page count {pages_count}")
+        if left < 0 or top < 0 or right <= left or bottom <= top:
+            raise ValueError(f"invalid bbox: {region.bbox}")
+        if region.page_pixel_size[0] <= 0 or region.page_pixel_size[1] <= 0:
+            raise ValueError("page_pixel_size must be positive")
+        if right > region.page_pixel_size[0] or bottom > region.page_pixel_size[1]:
+            raise ValueError("bbox exceeds page_pixel_size")
+
+    def _write_erasure_overlay(
+        self, canvas, output_path: Path, width: float, height: float,
+        erasures: tuple[EraseRectangle, ...],
+    ) -> None:
+        overlay = canvas.Canvas(str(output_path), pagesize=(width, height))
+        self._eraser.draw(overlay, erasures, height)
+        overlay.save()
+
+
+def _formula_fragment_with_actual_text(pypdf, pdf: bytes, latex: str):
+    """Return one formula fragment whose visible marks carry replacement text.
+
+    A TeX/Matplotlib fragment is a visual PDF subtree, not the surrounding
+    Qt text layer. Wrapping its content in a marked-content ``Span`` gives
+    compliant extractors a character replacement without adding transparent
+    text or changing the formula's measured geometry. The span travels with
+    the fragment when :meth:`PageObject.merge_transformed_page` imports it.
+
+    This deliberately does *not* claim to construct a complete tagged PDF:
+    the surrounding Qt text page has no structure tree. It does ensure that
+    an extractor which supports marked-content ``ActualText`` sees the plain
+    formula once rather than the TeX fragment's implementation glyphs.
+    """
+    fragment = pypdf.PdfReader(BytesIO(pdf)).pages[0]
+    actual_text = latex_to_plain_text(latex)
+    return _set_page_actual_text(fragment, actual_text)
+
+
+def _set_page_actual_text(page, actual_text: str):
+    """Mark an existing PDF text stream with one extractor replacement string."""
+    contents = page.get_contents()
+    if not actual_text or contents is None:
+        return page
+
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    resources = page[NameObject("/Resources")].get_object()
+    fonts = resources.get(NameObject("/Font"))
+    if fonts is None:
+        fonts = DictionaryObject()
+        resources[NameObject("/Font")] = fonts
+    else:
+        fonts = fonts.get_object()
+    fonts[NameObject("/PDFCraftActualText")] = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+        NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+    })
+
+    stream = DecodedStreamObject()
+    stream.set_data(
+        b"/Span << /ActualText " + _pdf_utf16_hex_string(actual_text) + b" >> BDC\n"
+        # Poppler does not emit ActualText for a marked sequence whose only
+        # glyphs are beyond the CropBox.  A one-point, invisible, page-local
+        # glyph anchors the same marked sequence without affecting appearance
+        # or adding an independently selectable duplicate.
+        + b"q\nBT /PDFCraftActualText 1 Tf 3 Tr 1 1 Td ( ) Tj ET\nQ\n"
+        + contents.get_data()
+        + b"\nEMC\n"
+    )
+    page[NameObject("/Contents")] = stream
+    return page
+
+
+def _pdf_utf16_hex_string(text: str) -> bytes:
+    """Encode a PDF Unicode text string as a syntax-safe hexadecimal literal."""
+    return b"<FEFF" + text.encode("utf-16-be").hex().upper().encode("ascii") + b">"
+
+
+def _check_ignore_error(checker: ErrorPolicyInput, error: Exception, *, replacement=None, replacements=(), page_indexes=(), stage='pdf_fill') -> bool:
+    from ..._policy import decide_sync
+    from ...policies import FailureCategory, FailureLocation
+    from ...document.access import PageGeometry
+    from ...document.paragraph import SourceRegion
+    values = (replacement,) if replacement is not None else replacements
+    targets = []
+    for value in values:
+        regions = tuple(SourceRegion(PageGeometry(region.page_index, region.page_pixel_size[0],
+                                     region.page_pixel_size[1], region.dpi), region.reading_order, region.bbox)
+                        for region in value.source_regions())
+        pages = tuple(dict.fromkeys(region.page.page_index for region in regions))
+        first = regions[0] if regions else None
+        targets.append(FailureLocation('regions', page_indexes=pages, regions=regions,
+            unit_id=f'paragraph:{first.page.page_index}:{first.source_order_in_page}' if first else None,
+            original=value.text))
+    if not page_indexes:
+        page_indexes = tuple(dict.fromkeys(index for target in targets for index in target.page_indexes))
+    if not targets:
+        targets.append(FailureLocation('page', page_indexes=tuple(page_indexes)))
+    affected = tuple(FailureLocation('page', page_indexes=(index,)) for index in page_indexes)
+    return decide_sync(checker, error, FailureCategory.PDF_FILL, stage, 'original_pdf_page',
+                       targets=tuple(targets), affected=affected)
+
+
+def _replacement_pages_in_source(replacement: PDFReplacement, pages_count: int) -> tuple[int, ...]:
+    """Return real source pages touched by a replacement, even if its bbox is bad."""
+    return tuple(sorted({
+        region.page_index
+        for region in replacement.source_regions()
+        if 1 <= region.page_index <= pages_count
+    }))
+
+
+def _prepend(first: PDFReplacement, replacements: Iterable[PDFReplacement]) -> Iterable[PDFReplacement]:
+    """Yield a probed replacement without materializing a large PDF plan."""
+    yield first
+    yield from replacements
+
+
+def _source_document_metadata(reader) -> dict[str, str]:
+    """Copy readable source document-information entries into a new writer."""
+    return {
+        str(key): str(value)
+        for key, value in (reader.metadata or {}).items()
+        if value is not None
+    }
+
+
+def _write_visual_source(source: Path, output: Path) -> None:
+    import pypdf
+    write_annotation_free_copy(pypdf.PdfReader(str(source)), output)
+
+
+def _compose_pdf(patcher, source, target, replacements, error_policy, metadata, visual_base):
+    """Native pypdf/Qt adapter; no requests or async orchestration run here."""
+    patcher._compose(  # pylint: disable=protected-access
+        source, target, replacements, error_policy=error_policy,
+        document_metadata=metadata, visual_base_path=visual_base,
+    )
+    return getattr(patcher._filler, "font_resolutions", ()), patcher.failed_page_indexes

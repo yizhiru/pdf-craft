@@ -1,24 +1,43 @@
 """Repository-local CLI for repeatable pdf-craft conversions and smoke runs."""
 
+from pdf_craft import RetryPolicy, ErrorPolicy
+
 import argparse
+import asyncio
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
 from pdf_craft import (
-    ChapterXMLTransformer,
-    DocumentPackage,
+    ConcurrentExecutor,
     ExtractionOptions,
+    FootnoteOptions,
+    FixedCapacity,
     OCRMode,
     OCRTokensMetering,
     PDFCraft,
+    PDFCraftExtraction,
     PDFOptions,
     SubmitKind,
     XMLTranslator,
 )
+from pdf_craft.jev import JEVRuntime
+from pdf_craft.extractor.chapter.generation import prepare_chapter_analysis
+from pdf_craft.extractor.chapter.page_review import (
+    JEV_REVIEW_THRESHOLD,
+    JevReviewProcessor,
+)
+from pdf_craft.extractor.chapter.page_repair import (
+    AllPageLlmRepairProcessor,
+    JevLlmRepairProcessor,
+)
+from pdf_craft.extractor.toc import TocInfo
+from pdf_craft.llm import runtime_for
 
+from .jev import PinnedJevEvaluator
 from .runtime import (
+    create_jev_from_env,
     create_ocr_config_from_env,
     create_llm_from_env,
     load_project_env,
@@ -34,7 +53,8 @@ from .smoke.assets import discover_assets
 @dataclass(frozen=True)
 class _ExtractionResult:
     craft: PDFCraft
-    package: DocumentPackage
+    extraction: PDFCraftExtraction
+    path: Path
     metering: OCRTokensMetering
 
 
@@ -54,7 +74,7 @@ def _parser() -> argparse.ArgumentParser:
 
     pdf = commands.add_parser("pdf", help="extract, convert, or translate a PDF")
     pdf_commands = pdf.add_subparsers(dest="pdf_command", required=True)
-    extract = pdf_commands.add_parser("extract", help="PDF -> DocumentPackage")
+    extract = pdf_commands.add_parser("extract", help="PDF -> PDFCraftExtraction (.pcex)")
     _add_pdf_source(extract)
     _add_extraction_options(extract)
     extract.set_defaults(handler=_extract_pdf)
@@ -71,32 +91,44 @@ def _parser() -> argparse.ArgumentParser:
     translate.add_argument("target_language")
     translate.add_argument("--format", choices=("markdown", "epub", "pdf"), default="pdf")
     translate.add_argument("--output", type=Path, help="translated file; defaults inside --work-dir")
+    translate.add_argument(
+        "--with-furniture", action="store_true",
+        help="translate native page furniture when producing a PDF",
+    )
     _add_translation_options(translate)
     _add_extraction_options(translate)
     translate.set_defaults(handler=_translate_pdf)
 
-    package = commands.add_parser("package", help="operate on an existing DocumentPackage")
+    package = commands.add_parser("package", help="operate on a PDFCraftExtraction (.pcex)")
     package_commands = package.add_subparsers(dest="package_command", required=True)
     package_translate = package_commands.add_parser(
-        "translate", help="translate an existing DocumentPackage"
+        "translate", help="translate an existing PDFCraftExtraction"
     )
     package_translate.add_argument("package", type=Path)
     package_translate.add_argument("target_language")
     package_translate.add_argument("--output-package", type=Path)
     _add_work_dir(package_translate, "isolated run directory")
     _add_translation_options(package_translate)
+    package_translate.add_argument(
+        "--with-furniture", action="store_true",
+        help="translate furniture already present in the package",
+    )
     package_translate.set_defaults(handler=_translate_package)
 
     package_patch = package_commands.add_parser(
-        "patch-pdf", help="patch an original PDF with an existing DocumentPackage"
+        "patch-pdf", help="patch an original PDF with a PDFCraftExtraction"
     )
     package_patch.add_argument("source", type=Path)
     package_patch.add_argument("package", type=Path)
     package_patch.add_argument("--output", type=Path, help="patched PDF; defaults inside --work-dir")
+    package_patch.add_argument(
+        "--translation-id",
+        help="translation version to patch; omit to use the package root content",
+    )
     _add_work_dir(package_patch, "isolated run directory")
     package_patch.set_defaults(handler=_patch_package_pdf)
 
-    render = package_commands.add_parser("render", help="DocumentPackage -> Markdown or EPUB")
+    render = package_commands.add_parser("render", help="PDFCraftExtraction -> Markdown or EPUB")
     render.add_argument("package", type=Path)
     render.add_argument("--format", choices=("markdown", "epub"), required=True)
     render.add_argument("--output", type=Path, help="rendered file; defaults inside --work-dir")
@@ -125,7 +157,7 @@ def _parser() -> argparse.ArgumentParser:
         "--route",
         choices=(
             "package", "package-markdown", "package-epub", "markdown", "epub",
-            "pdf-patch", "epub-check", "epub-translate",
+            "pdf-patch", "epub-check", "epub-translate", "page-repair",
         ),
         required=True,
     )
@@ -133,6 +165,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT / "smoke")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--ocr-mode", choices=_ocr_modes())
+    run.add_argument("--jev-baseline", type=Path)
+    run.add_argument("--jev-run")
+    run.add_argument("--page-repair-expected", type=Path)
+    run.add_argument("--llm-profile", default="default")
     _add_smoke_options(run)
     run.set_defaults(handler=_run_smoke)
 
@@ -142,6 +178,57 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT / "smoke")
     matrix.add_argument("--dry-run", action="store_true")
     matrix.set_defaults(handler=_run_matrix)
+
+    analysis = commands.add_parser(
+        "analysis", help="inspect experimental page-analysis stages"
+    )
+    analysis_commands = analysis.add_subparsers(
+        dest="analysis_command", required=True
+    )
+    review_jev = analysis_commands.add_parser(
+        "review-jev", help="review cached OCR pages with the official JEV service"
+    )
+    review_jev.add_argument("ocr_path", type=Path)
+    review_jev.add_argument("--output", type=Path, required=True)
+    review_jev.add_argument(
+        "--threshold", type=float, default=JEV_REVIEW_THRESHOLD
+    )
+    review_jev.add_argument("--concurrency", type=int, default=4)
+    review_jev.set_defaults(handler=_review_jev)
+    repair_pages = analysis_commands.add_parser(
+        "repair-jev-llm",
+        help="route cached OCR pages through JEV and repair selected pages with LLM",
+    )
+    repair_pages.add_argument("ocr_path", type=Path)
+    repair_pages.add_argument("--output", type=Path, required=True)
+    repair_pages.add_argument("--llm-profile", default="page-repair")
+    repair_pages.add_argument(
+        "--all-pages",
+        action="store_true",
+        help="skip JEV and repair every page without disclosing JEV scores",
+    )
+    repair_pages.add_argument(
+        "--llm-pages",
+        help=(
+            "skip JEV and repair comma-separated 1-based pages without "
+            "disclosing JEV scores"
+        ),
+    )
+    repair_pages.add_argument(
+        "--jev-baseline",
+        type=Path,
+        help="replay a committed JEV probability baseline instead of calling oo",
+    )
+    repair_pages.add_argument(
+        "--jev-run",
+        help="named run in --jev-baseline; defaults to its first run",
+    )
+    repair_pages.add_argument(
+        "--threshold", type=float, default=JEV_REVIEW_THRESHOLD
+    )
+    repair_pages.add_argument("--analysis-retries", type=int, default=3)
+    repair_pages.add_argument("--concurrency", type=int, default=4)
+    repair_pages.set_defaults(handler=_repair_jev_llm)
     return parser
 
 
@@ -163,17 +250,20 @@ def _add_extraction_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-page-image-file-size", type=int)
     parser.add_argument("--max-ocr-tokens", type=int)
     parser.add_argument("--max-ocr-output-tokens", type=int)
+    parser.add_argument("--ocr-concurrency", type=int, default=1)
     parser.add_argument("--cover", action="store_true")
     parser.add_argument("--footnotes", action="store_true")
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--toc-assumed", action="store_true")
     parser.add_argument("--toc-llm", metavar="PROFILE", help="optional LLM profile for TOC hierarchy analysis")
+    parser.add_argument("--book-metadata", action="store_true", help="extract bibliographic metadata from front OCR pages")
+    parser.add_argument("--metadata-llm", metavar="PROFILE", help="LLM profile used with --book-metadata")
 
 
 def _add_translation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--submit", choices=("replace", "append-block"), default="replace")
     parser.add_argument("--prompt")
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--fill-retries", type=int, default=3)
     parser.add_argument("--max-group-tokens", type=int, default=2600)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--translation-llm", default="translation", metavar="PROFILE")
@@ -188,16 +278,19 @@ def _add_smoke_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-page-image-file-size", type=int)
     parser.add_argument("--max-ocr-tokens", type=int)
     parser.add_argument("--max-ocr-output-tokens", type=int)
+    parser.add_argument("--ocr-concurrency", type=int, default=1)
     parser.add_argument("--cover", action="store_true")
     parser.add_argument("--footnotes", action="store_true")
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--toc-assumed", action="store_true")
     parser.add_argument("--marker", help="deterministic package-transform marker for Markdown or EPUB routes")
     parser.add_argument("--submit", choices=("replace", "append-block"), default="replace")
+    parser.add_argument("--render-mode", choices=("replace", "bilingual"))
+    parser.add_argument("--translation-id")
     parser.add_argument("--patch-prefix", help="deterministic prefix used by the PDF patch smoke route")
     parser.add_argument("--target-language", default="zh")
     parser.add_argument("--prompt")
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--fill-retries", type=int, default=3)
     parser.add_argument("--max-group-tokens", type=int, default=2600)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--translation-llm-profile", metavar="PROFILE")
@@ -206,18 +299,18 @@ def _add_smoke_options(parser: argparse.ArgumentParser) -> None:
 
 def _extract_pdf(args: argparse.Namespace) -> None:
     work_dir = _work_dir(args.source, args.work_dir, "extract")
-    result = _extract(args, work_dir / "package")
-    print(f"Package: {result.package.chapters_path.parent}")
+    result = _extract(args, work_dir / "book.pcex", includes_furniture=True)
+    print(f"Extraction: {result.path}")
     _print_metering(result.metering)
 
 
 def _convert_pdf(args: argparse.Namespace) -> None:
     work_dir = _work_dir(args.source, args.work_dir, "convert")
-    result = _extract(args, work_dir / "package")
+    result = _extract(args, work_dir / "book.pcex", includes_furniture=False)
     output = args.output or work_dir / ("book.md" if args.format == "markdown" else "book.epub")
     output.parent.mkdir(parents=True, exist_ok=True)
-    _render(result.craft, result.package, args.format, output)
-    print(f"Package: {result.package.chapters_path.parent}")
+    _render(result.craft, result.extraction, args.format, output)
+    print(f"Extraction: {result.path}")
     print(f"Output: {output}")
     _print_metering(result.metering)
 
@@ -225,22 +318,30 @@ def _convert_pdf(args: argparse.Namespace) -> None:
 def _translate_pdf(args: argparse.Namespace) -> None:
     if args.format == "pdf" and args.submit != "replace":
         raise SystemExit("PDF output supports only --submit replace")
+    if args.with_furniture and args.format != "pdf":
+        raise SystemExit("--with-furniture is supported only with --format pdf")
     work_dir = _work_dir(args.source, args.work_dir, "translate")
-    result = _extract(args, work_dir / "package")
-    transformer = _xml_transformer(args, work_dir)
+    with_furniture = args.format == "pdf" and args.with_furniture
+    result = _extract(args, work_dir / "book.pcex", includes_furniture=with_furniture)
+    translator = _xml_translator(args, work_dir)
     if args.format == "pdf":
         output = args.output or work_dir / f"{args.source.stem}-{args.target_language}.pdf"
         output.parent.mkdir(parents=True, exist_ok=True)
-        result.craft.translate_pdf(args.source, result.package, output, transformer)
+        result.craft.translate_pdf(
+            args.source, result.extraction, output, translator,
+            window=args.concurrency,
+            with_furniture=with_furniture,
+        )
     else:
         mode = SubmitKind[args.submit.replace("-", "_").upper()]
-        translated = result.craft.translate_package(
-            result.package, work_dir / "translated", transformer, submit=mode,
+        translated = result.craft.translate_extraction(
+            result.extraction, work_dir / "translated.pcex", translator,
+            submit=mode, window=args.concurrency,
         )
         output = args.output or work_dir / ("book.md" if args.format == "markdown" else "book.epub")
         output.parent.mkdir(parents=True, exist_ok=True)
         _render(result.craft, translated, args.format, output)
-    print(f"Package: {result.package.chapters_path.parent}")
+    print(f"Extraction: {result.path}")
     print(f"Output: {output}")
     _print_metering(result.metering)
 
@@ -248,31 +349,38 @@ def _translate_pdf(args: argparse.Namespace) -> None:
 def _translate_package(args: argparse.Namespace) -> None:
     load_project_env(_project_root())
     work_dir = _work_dir(args.package, args.work_dir, "package-translate")
-    package = DocumentPackage.from_path(args.package).validate()
-    output_package = args.output_package or work_dir / "translated-package"
-    transformer = _xml_transformer(args, work_dir)
+    craft = PDFCraft()
+    extraction = craft.open_extraction(args.package)
+    output_package = args.output_package or work_dir / "translated.pcex"
+    translator = _xml_translator(args, work_dir)
     mode = SubmitKind[args.submit.replace("-", "_").upper()]
-    translated = PDFCraft().translate_package(
-        package, output_package, transformer, submit=mode,
+    craft.translate_extraction(
+        extraction, output_package, translator, submit=mode,
+        window=args.concurrency,
+        with_furniture=args.with_furniture, target_language=args.target_language,
     )
-    print(f"Package: {translated.chapters_path.parent}")
+    print(f"Extraction: {output_package}")
 
 
 def _patch_package_pdf(args: argparse.Namespace) -> None:
     work_dir = _work_dir(args.source, args.work_dir, "package-patch")
-    package = DocumentPackage.from_path(args.package).validate()
+    craft = PDFCraft()
+    extraction = craft.open_extraction(args.package)
     output = args.output or work_dir / f"{args.source.stem}-patched.pdf"
     output.parent.mkdir(parents=True, exist_ok=True)
-    PDFCraft().patch_pdf_with_package(args.source, package, output)
+    craft.patch_pdf_with_extraction(
+        args.source, extraction, output, translation_id=args.translation_id,
+    )
     print(f"Output: {output}")
 
 
 def _render_package(args: argparse.Namespace) -> None:
     work_dir = _work_dir(args.package, args.work_dir, "render")
-    package = DocumentPackage.from_path(args.package).validate()
+    craft = PDFCraft()
+    extraction = craft.open_extraction(args.package)
     output = args.output or work_dir / ("book.md" if args.format == "markdown" else "book.epub")
     output.parent.mkdir(parents=True, exist_ok=True)
-    _render(PDFCraft(), package, args.format, output)
+    _render(craft, extraction, args.format, output)
     print(f"Output: {output}")
 
 
@@ -290,8 +398,9 @@ def _translate_epub(args: argparse.Namespace) -> None:
     PDFCraft().translate_epub(
         args.source, output, target_language=args.target_language,
         submit=SubmitKind[args.submit.replace("-", "_").upper()],
-        user_prompt=args.prompt, max_retries=args.max_retries,
-        max_group_tokens=args.max_group_tokens, concurrency=args.concurrency,
+        user_prompt=args.prompt, retry_policy=RetryPolicy(fill=args.fill_retries),
+        max_group_tokens=args.max_group_tokens, window=args.concurrency,
+        executor=ConcurrentExecutor(FixedCapacity(args.concurrency)),
         translation_llm=translation_llm, fill_llm=fill_llm,
     )
     print(f"Output: {output}")
@@ -308,12 +417,20 @@ def _run_smoke(args: argparse.Namespace) -> int:
     if args.marker:
         translation["package_marker"] = args.marker
         translation["package_submit"] = args.submit.replace("-", "_").upper()
+        translation["target_language"] = args.target_language
+    if args.render_mode:
+        translation["render_mode"] = args.render_mode.upper()
+    if args.translation_id:
+        translation["translation_id"] = args.translation_id
     if args.patch_prefix:
         translation["patch_prefix"] = args.patch_prefix
     is_pdf_route = args.route in {
         "package", "package-markdown", "package-epub", "markdown", "epub", "pdf-patch",
     }
-    if (is_pdf_route or args.route == "epub-translate") and not args.dry_run:
+    if (
+        is_pdf_route
+        or args.route in {"epub-translate", "page-repair"}
+    ) and not args.dry_run:
         load_project_env(_project_root())
     ocr_mode = cast(OCRMode | None, args.ocr_mode)
     if is_pdf_route:
@@ -328,22 +445,43 @@ def _run_smoke(args: argparse.Namespace) -> int:
             "fill_llm_profile": fill_profile,
             "target_language": args.target_language,
             "user_prompt": args.prompt,
-            "max_retries": args.max_retries,
+            "retry_policy": {"fill": args.fill_retries},
             "max_group_tokens": args.max_group_tokens,
             "concurrency": args.concurrency,
             "submit": args.submit.replace("-", "_").upper(),
         })
         if not args.dry_run:
             translation = _resolve_translation_profiles(translation, args.output_root) or {}
+    page_repair = None
+    if args.route == "page-repair":
+        if args.jev_baseline is None or args.page_repair_expected is None:
+            raise SystemExit(
+                "page-repair smoke requires --jev-baseline and "
+                "--page-repair-expected"
+            )
+        page_repair = {
+            "jev_baseline": str(args.jev_baseline),
+            "jev_run": args.jev_run,
+            "expected": str(args.page_repair_expected),
+            "llm_profile": args.llm_profile,
+            "retry_policy": {"analysis": args.fill_retries},
+            "concurrency": args.concurrency,
+        }
+        if not args.dry_run:
+            page_repair = _resolve_page_repair_profile(
+                page_repair, args.output_root
+            )
     run = SmokeRun(
         asset=args.asset, route=args.route, backend=ocr_mode,
         page_indexes=_page_indexes(args.pages), ocr_size=ocr_size, dpi=args.dpi,
         max_page_image_file_size=args.max_page_image_file_size,
         max_ocr_tokens=args.max_ocr_tokens, max_ocr_output_tokens=args.max_ocr_output_tokens,
+        ocr_concurrency=args.ocr_concurrency,
         includes_cover=args.cover, includes_footnotes=args.footnotes,
         generate_plot=args.plot, toc_assumed=args.toc_assumed,
         ocr=ocr_values_from_env(ocr_mode) if ocr_mode and not args.dry_run else None,
         translation=translation or None,
+        page_repair=page_repair,
     )
     run_path = run_smoke(run, assets_root=args.assets_root, output_root=args.output_root, dry_run=args.dry_run)
     print(run_path)
@@ -374,6 +512,264 @@ def _run_matrix(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _review_jev(args: argparse.Namespace) -> None:
+    load_project_env(_project_root())
+    asyncio.run(_review_jev_async(args))
+
+
+async def _review_jev_async(args: argparse.Namespace) -> None:
+    raw_path = args.output / "raw"
+    analysis = prepare_chapter_analysis(args.ocr_path, TocInfo([], []))
+    config = create_jev_from_env()
+    executor = ConcurrentExecutor(FixedCapacity(args.concurrency))
+    async with JEVRuntime(config, executor) as runtime:
+        reviewer = JevReviewProcessor(
+            _recording_jev_evaluator(runtime.evaluate, raw_path),
+            threshold=args.threshold,
+            batch_evaluator=_recording_jev_batch_evaluator(
+                runtime.evaluate_many, raw_path,
+            ),
+        )
+        await reviewer(
+            analysis.source_pages,
+            analysis.pages,
+            analysis.page_pixel_sizes,
+        )
+    args.output.mkdir(parents=True, exist_ok=True)
+    report = {
+        "threshold": args.threshold,
+        "page_count": len(reviewer.results),
+        "review_page_indexes": [
+            result.page_index
+            for result in reviewer.results
+            if result.requires_review
+        ],
+        "pages": [
+            {
+                "page_index": result.page_index,
+                "pass_probability": result.pass_probability,
+                "risk": result.risk,
+                "requires_review": result.requires_review,
+            }
+            for result in reviewer.results
+        ],
+    }
+    report_path = args.output / "report.json"
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(report_path)
+
+
+def _repair_jev_llm(args: argparse.Namespace) -> None:
+    load_project_env(_project_root())
+    asyncio.run(_repair_jev_llm_async(args))
+
+
+async def _repair_jev_llm_async(args: argparse.Namespace) -> None:
+    args.output.mkdir(parents=True, exist_ok=True)
+    llm = create_llm_from_env(
+        args.llm_profile,
+        cache_path=args.output / "llm-cache",
+        log_dir_path=args.output / "llm-logs",
+    )
+    executor = ConcurrentExecutor(FixedCapacity(args.concurrency))
+    runtime = runtime_for(
+        llm, executor, protocol_version="page-repair-json-v1",
+    )
+    llm_raw_path = args.output / "llm-raw"
+    llm_raw_path.mkdir(parents=True, exist_ok=True)
+
+    async def request(messages, index, maximum):
+        payload = json.loads(messages[1].message)
+        page_index = payload["target_page"]["page_index"]
+        stem = f"page_{page_index:03d}-attempt_{index + 1:02d}"
+        (llm_raw_path / f"{stem}-request.json").write_text(
+            json.dumps(
+                [
+                    {"role": message.role.name.lower(), "content": message.message}
+                    for message in messages
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        response = await runtime.request(
+            messages,
+            max_tokens=16000,
+            retry_index=index,
+            retry_max=maximum,
+            use_cache=False,
+        )
+        (llm_raw_path / f"{stem}-response.txt").write_text(
+            response + "\n", encoding="utf-8"
+        )
+        return response
+
+    llm_page_indexes = _page_indexes(args.llm_pages)
+    if args.all_pages and llm_page_indexes is not None:
+        raise ValueError("--all-pages cannot be combined with --llm-pages")
+    jev_runtime = None
+    if args.all_pages or llm_page_indexes is not None:
+        if args.jev_baseline is not None or args.jev_run is not None:
+            raise ValueError("direct LLM page selection cannot be combined with JEV options")
+        all_page_processor = AllPageLlmRepairProcessor(
+            request,
+            page_indexes=llm_page_indexes,
+            retry_policy=RetryPolicy(analysis=args.analysis_retries),
+        )
+        processor = all_page_processor
+        jev_processor = None
+        jev_source = {
+            "type": (
+                "skipped-all-pages" if args.all_pages
+                else "skipped-selected-pages"
+            )
+        }
+    else:
+        all_page_processor = None
+        if args.jev_baseline is not None:
+            evaluator = PinnedJevEvaluator(args.jev_baseline, args.jev_run)
+            jev_source = {
+                "type": "pinned-baseline",
+                "path": str(args.jev_baseline),
+                "run": evaluator.run_name,
+            }
+        else:
+            if args.jev_run is not None:
+                raise ValueError("--jev-run requires --jev-baseline")
+            jev_config = create_jev_from_env()
+            jev_runtime = JEVRuntime(jev_config, executor)
+            await jev_runtime.__aenter__()
+            evaluator = _recording_jev_evaluator(
+                jev_runtime.evaluate,
+                args.output / "jev-raw",
+            )
+            jev_source = {
+                "type": "typesafe-sdk",
+                "model": jev_config.model,
+            }
+        jev_processor = JevLlmRepairProcessor(
+            evaluator,
+            request,
+            threshold=args.threshold,
+            retry_policy=RetryPolicy(analysis=args.analysis_retries),
+            batch_evaluator=(
+                _recording_jev_batch_evaluator(
+                    jev_runtime.evaluate_many,
+                    args.output / "jev-raw",
+                )
+                if jev_runtime is not None else None
+            ),
+        )
+        processor = jev_processor
+    analysis = prepare_chapter_analysis(args.ocr_path, TocInfo([], []))
+    try:
+        await processor(
+            analysis.source_pages,
+            analysis.pages,
+            analysis.page_pixel_sizes,
+        )
+    finally:
+        if jev_runtime is not None:
+            await jev_runtime.__aexit__(None, None, None)
+    if args.all_pages or llm_page_indexes is not None:
+        assert all_page_processor is not None
+        review_page_indexes = all_page_processor.page_indexes
+        page_reports = [
+            {
+                "page_index": page_index,
+                "pass_probability": None,
+                "risk": None,
+                "requires_review": True,
+            }
+            for page_index in all_page_processor.page_indexes
+        ]
+    else:
+        assert jev_processor is not None
+        review_page_indexes = [
+            result.page_index
+            for result in jev_processor.results
+            if result.requires_review
+        ]
+        page_reports = [
+            {
+                "page_index": result.page_index,
+                "pass_probability": result.pass_probability,
+                "risk": result.risk,
+                "requires_review": result.requires_review,
+            }
+            for result in jev_processor.results
+        ]
+    report = {
+        "jev_source": jev_source,
+        "threshold": (
+            None if args.all_pages or llm_page_indexes is not None
+            else args.threshold
+        ),
+        "page_count": len(page_reports),
+        "review_page_indexes": review_page_indexes,
+        "pages": page_reports,
+    }
+    report_path = args.output / "report.json"
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(report_path)
+
+
+def _recording_jev_evaluator(evaluator, output_path: Path):
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    async def evaluate(page_index: int, request: dict[str, Any]) -> float:
+        request_path = output_path / f"page_{page_index:03d}-request.json"
+        response_path = output_path / f"page_{page_index:03d}-response.json"
+        request_path.write_text(
+            json.dumps(request, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        probability = await evaluator(page_index, request)
+        response_path.write_text(
+            json.dumps(
+                {"pass_probability": probability},
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return probability
+
+    return evaluate
+
+
+def _recording_jev_batch_evaluator(evaluator, output_path: Path):
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    async def evaluate(requests):
+        request_list = list(requests)
+        for page_index, request in request_list:
+            (output_path / f"page_{page_index:03d}-request.json").write_text(
+                json.dumps(request, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        results = await evaluator(request_list)
+        for page_index, probability in results:
+            (output_path / f"page_{page_index:03d}-response.json").write_text(
+                json.dumps(
+                    {"pass_probability": probability},
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+        return results
+
+    return evaluate
+
+
 def _smoke_exit_code(run_path: Path) -> int:
     """Return a non-zero code for failed or skipped required smoke runs."""
     try:
@@ -387,10 +783,12 @@ def _matrix_run_needs_env(run: SmokeRun) -> bool:
     if run.backend and run.ocr is None:
         return True
     translation = run.translation or {}
-    return any(
+    if any(
         key in translation
         for key in ("llm_profile", "translation_llm_profile", "fill_llm_profile")
-    )
+    ):
+        return True
+    return "llm_profile" in (run.page_repair or {})
 
 
 def _resolve_matrix_runtime(run: SmokeRun, output_root: Path) -> SmokeRun:
@@ -399,7 +797,30 @@ def _resolve_matrix_runtime(run: SmokeRun, output_root: Path) -> SmokeRun:
     if run.backend and ocr is None:
         ocr = ocr_values_from_env(run.backend)
     translation = _resolve_translation_profiles(run.translation, output_root)
-    return replace(run, ocr=ocr, translation=translation)
+    page_repair = _resolve_page_repair_profile(run.page_repair, output_root)
+    return replace(
+        run,
+        ocr=ocr,
+        translation=translation,
+        page_repair=page_repair,
+    )
+
+
+def _resolve_page_repair_profile(
+    page_repair: dict[str, Any] | None,
+    output_root: Path,
+) -> dict[str, Any] | None:
+    if not page_repair:
+        return page_repair
+    resolved = dict(page_repair)
+    profile = resolved.pop("llm_profile", None)
+    if profile and "llm" not in resolved:
+        resolved["llm"] = llm_values_from_env(
+            str(profile),
+            cache_path=output_root / "_c" / "page-repair",
+            log_dir_path=output_root / "_l" / "page-repair",
+        )
+    return resolved
 
 
 def _resolve_translation_profiles(translation: dict[str, Any] | None, output_root: Path) -> dict[str, Any] | None:
@@ -424,47 +845,64 @@ def _resolve_translation_profiles(translation: dict[str, Any] | None, output_roo
     return resolved
 
 
-def _extract(args: argparse.Namespace, package_path: Path) -> _ExtractionResult:
+def _extract(
+    args: argparse.Namespace,
+    extraction_path: Path,
+    *,
+    includes_furniture: bool,
+) -> _ExtractionResult:
     load_project_env(_project_root())
     ocr_mode = cast(OCRMode | None, args.ocr_mode) or ocr_mode_from_env()
     ocr_size = _resolve_ocr_size(args.ocr_size, ocr_mode, args.default_ocr_size)
     _validate_ocr_size(ocr_mode, ocr_size)
-    _record_pdf_cache_owner(package_path.parent, args, ocr_mode, ocr_size)
-    craft = PDFCraft(pdf=PDFOptions(ocr=create_ocr_config_from_env(ocr_mode)))
-    package, metering = craft.extract_pdf_with_metering(
-        args.source, package_path, ExtractionOptions(
+    _record_pdf_cache_owner(
+        extraction_path.parent, args, ocr_mode, ocr_size, includes_furniture=includes_furniture,
+    )
+    craft = PDFCraft(pdf=PDFOptions(
+        ocr=create_ocr_config_from_env(ocr_mode),
+        ocr_executor=ConcurrentExecutor(FixedCapacity(args.ocr_concurrency)),
+    ))
+    extraction, metering = craft.extract_pdf_with_metering(
+        args.source, extraction_path, ExtractionOptions(
             page_indexes=_page_indexes(args.pages), ocr_size=cast(Any, ocr_size), dpi=args.dpi,
             max_page_image_file_size=args.max_page_image_file_size,
             max_ocr_tokens=args.max_ocr_tokens, max_ocr_output_tokens=args.max_ocr_output_tokens,
-            includes_cover=args.cover, includes_footnotes=args.footnotes,
+            includes_cover=args.cover,
+            footnotes=FootnoteOptions() if args.footnotes else None,
+            includes_furniture=includes_furniture,
+            extract_book_metadata=args.book_metadata,
+            metadata_llm=(create_llm_from_env(args.metadata_llm, cache_path=extraction_path.parent / "metadata-cache",
+                log_dir_path=extraction_path.parent / "metadata-logs") if args.metadata_llm else None),
             generate_plot=args.plot, toc_assumed=args.toc_assumed,
-            toc_llm=(create_llm_from_env(args.toc_llm, cache_path=package_path.parent / "toc-cache",
-                log_dir_path=package_path.parent / "toc-logs") if args.toc_llm else None),
-            on_ocr_event=_print_ocr_event,
-        )
+            toc_llm=(create_llm_from_env(args.toc_llm, cache_path=extraction_path.parent / "toc-cache",
+                log_dir_path=extraction_path.parent / "toc-logs") if args.toc_llm else None),
+            on_extraction_event=_print_ocr_event,
+        ),
+        analysing_path=extraction_path.parent / "analysis",
     )
-    return _ExtractionResult(craft, package, metering)
+    return _ExtractionResult(craft, extraction, extraction_path, metering)
 
 
-def _xml_transformer(args: argparse.Namespace, work_dir: Path) -> ChapterXMLTransformer:
+def _xml_translator(args: argparse.Namespace, work_dir: Path) -> XMLTranslator:
     translation_llm = create_llm_from_env(args.translation_llm,
         cache_path=work_dir / "translation-cache", log_dir_path=work_dir / "translation-logs")
     fill_llm = translation_llm if args.fill_llm == args.translation_llm else create_llm_from_env(args.fill_llm,
         cache_path=work_dir / "fill-cache", log_dir_path=work_dir / "fill-logs")
-    translator = XMLTranslator(
+    return XMLTranslator(
         translation_llm=translation_llm, fill_llm=fill_llm, target_language=args.target_language,
-        user_prompt=args.prompt, ignore_translated_error=False, max_retries=args.max_retries,
+        user_prompt=args.prompt,  retry_policy=RetryPolicy(fill=args.fill_retries),
         max_fill_displaying_errors=3, max_group_score=args.max_group_tokens,
+        executor=ConcurrentExecutor(FixedCapacity(args.concurrency)),
         cache_seed_content=f"pdf-craft-tool:{args.target_language}",
     )
-    return ChapterXMLTransformer(cast(Any, translator))
 
 
-def _render(craft: PDFCraft, package: DocumentPackage, format_name: str, output: Path) -> None:
+def _render(craft: PDFCraft, extraction: PDFCraftExtraction,
+            format_name: str, output: Path) -> None:
     if format_name == "markdown":
-        craft.render_markdown(package, output, Path("assets"))
+        craft.render_markdown(extraction, output, Path("assets"))
     else:
-        craft.render_epub(package, output)
+        craft.render_epub(extraction, output)
 
 
 def _work_dir(source: Path, requested: Path | None, operation: str) -> Path:
@@ -482,6 +920,8 @@ def _record_pdf_cache_owner(
     args: argparse.Namespace,
     ocr_mode: OCRMode,
     ocr_size: str,
+    *,
+    includes_furniture: bool = True,
 ) -> None:
     """Guard manual PDF work-dir reuse so OCR caches stay tied to one source/backend."""
     path = work_dir / ".pdf-craft-tool-run.json"
@@ -497,6 +937,7 @@ def _record_pdf_cache_owner(
         "dpi": args.dpi,
         "max_page_image_file_size": args.max_page_image_file_size,
         "includes_footnotes": args.footnotes,
+        "includes_furniture": includes_furniture,
         "max_ocr_tokens": args.max_ocr_tokens,
         "max_ocr_output_tokens": args.max_ocr_output_tokens,
     }
@@ -513,7 +954,7 @@ def _record_pdf_cache_owner(
                 f"settings ({', '.join(mismatched)}): {work_dir}"
             )
         return
-    if (work_dir / "package" / "ocr").exists():
+    if (work_dir / "analysis" / "ocr").exists():
         raise SystemExit(
             "Work directory contains legacy OCR cache without ownership metadata; "
             f"use a fresh directory or remove the stale cache: {work_dir}"
@@ -561,7 +1002,8 @@ def _project_root() -> Path:
 
 
 def _print_ocr_event(event) -> None:
-    print(f"OCR {event.kind.name.lower()}: page {event.page_index}/{event.total_pages}")
+    print(f"[{event.operation.name}] {event.kind.name} unit={event.unit_id} "
+          f"page={event.page_index} stage={event.stage} outcome={event.outcome}")
 
 
 def _print_metering(metering) -> None:
